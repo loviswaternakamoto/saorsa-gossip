@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.88] - 2026-10-12
+
 ### Added
 
 - **membership: a step-by-step JOIN API with one retry ledger per seed (for
@@ -34,10 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waits for a lock changes nothing; the seed can then have the JOIN frame. It
   does not hold one of its locks (SWIM state, active view, passive view)
   while it waits for another: it takes them with `try_write`, and when one is
-  busy it releases the others and waits for that one alone. So view
-  contention does not delay SWIM, and `active_view()` does not read as empty
-  while a commit waits. After eight busy rounds it waits in the fixed order,
-  which bounds the retries.
+  busy it releases the others and waits for that one alone. So, in normal
+  rounds, view contention does not delay SWIM. After eight busy rounds it
+  waits in the fixed order (SWIM state, then active, then passive), which
+  bounds the retries; in that fallback it can hold SWIM state while it waits
+  for the active view, and the active view while it waits for the passive
+  view. `active_view()` can read as empty during the commit's synchronous
+  changes, while a writer waits in the active view's fair queue, and during
+  the fallback's passive wait (ADR-015).
   `Membership::join` keeps its signature and behaviour and now runs on these
   steps; a differential test compares it frame for frame, side effect for
   side effect and backoff for backoff with a verbatim copy of the 0.5.87 loop
