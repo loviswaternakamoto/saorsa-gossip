@@ -539,11 +539,12 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
     ///
     /// Marks the sender as alive and clears any pending probe for this peer.
     pub async fn handle_ack(&self, sender: PeerId) -> Result<()> {
-        // Mark sender as alive - they responded to our ping
-        self.mark_alive(sender).await;
-
-        // Clear pending probe if one exists
+        // Clear the pending probe first, then mark the sender alive (it
+        // responded to our ping). The probe-timeout task re-checks the probe
+        // while it holds the state lock, so this ACK is either seen by that
+        // re-check or marks the sender alive after the timeout's write.
         let was_pending = self.clear_probe(&sender).await;
+        self.mark_alive(sender).await;
         let indirect_requesters = self.take_indirect_probe_requesters(sender).await;
 
         if was_pending {
@@ -703,11 +704,10 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
             "SWIM: Received AckResponse, marking target as alive"
         );
 
-        // Mark target as alive (overrides suspect)
-        self.mark_alive(target).await;
-
-        // Clear any pending probe for this target
+        // Clear any pending probe for this target, then mark it alive
+        // (overrides suspect). The order is the same as in `handle_ack`.
         self.clear_probe(&target).await;
+        self.mark_alive(target).await;
 
         Ok(())
     }
@@ -738,18 +738,36 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
                     for (peer, probe_time) in pending.iter() {
                         let elapsed = now.duration_since(*probe_time);
                         if elapsed >= Duration::from_millis(SWIM_ACK_TIMEOUT_MS) {
-                            timed_out_peers.push(*peer);
+                            timed_out_peers.push((*peer, *probe_time));
                         }
                     }
                 }
 
                 // For each timed-out peer: mark as suspect and trigger indirect probes
-                for peer in timed_out_peers {
-                    debug!(peer_id = %peer, "SWIM: Probe timeout, marking suspect");
-
+                for (peer, probe_time) in timed_out_peers {
                     // Mark as suspect
                     {
                         let mut states_guard = states.write().await;
+                        // An ACK can have arrived after the scan. With the
+                        // state lock held, check that the same probe is
+                        // still pending. An ACK clears the probe before it
+                        // marks the peer alive, so it is either seen here or
+                        // marks the peer alive after this write. The check
+                        // does not wait for the probe table while it holds
+                        // the state lock: when that table is busy, the next
+                        // scan decides.
+                        let still_pending = match pending_probes.try_read() {
+                            Ok(pending) => pending.get(&peer) == Some(&probe_time),
+                            Err(_) => {
+                                trace!(peer_id = %peer, "SWIM: Probe table busy; the next scan decides");
+                                continue;
+                            }
+                        };
+                        if !still_pending {
+                            trace!(peer_id = %peer, "SWIM: Probe answered after the timeout scan");
+                            continue;
+                        }
+                        debug!(peer_id = %peer, "SWIM: Probe timeout, marking suspect");
                         if let Some(entry) = states_guard.get_mut(&peer) {
                             if entry.state == PeerState::Alive {
                                 entry.state = PeerState::Suspect;
@@ -1081,6 +1099,22 @@ pub struct HyParViewMembership<T: GossipTransport + 'static> {
     seen_peers: Arc<RwLock<HashMap<PeerId, Instant>>>,
     /// Transport layer for sending messages
     transport: Arc<T>,
+    /// Serializes the local commits of `add_active` / `join_send`. Only
+    /// commits take it; no reader of the views or of SWIM waits for it.
+    commit_gate: tokio::sync::Mutex<()>,
+}
+
+/// Busy rounds after which [`HyParViewMembership::commit_active`] stops
+/// trying the locks without waiting and waits for them in the fixed order.
+const COMMIT_TRY_ROUNDS: usize = 8;
+
+/// The lock that a commit round found busy
+/// ([`HyParViewMembership::commit_active`]).
+#[derive(Debug, Clone, Copy)]
+enum CommitLock {
+    Swim,
+    Active,
+    Passive,
 }
 
 impl<T: GossipTransport + 'static> HyParViewMembership<T> {
@@ -1101,6 +1135,7 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
             config,
             seen_peers: Arc::new(RwLock::new(HashMap::new())),
             transport,
+            commit_gate: tokio::sync::Mutex::new(()),
         };
 
         // Start background shuffle task
@@ -1308,16 +1343,23 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
     /// - Then the local commit (the active-view insert, a demotion to the
     ///   passive view when the active view is full, and the SWIM alive mark)
     ///   takes every lock that it needs before its first change: the SWIM
-    ///   state, the active view, then the passive view when a demotion is
+    ///   state, the active view, and the passive view when a demotion is
     ///   due. After that it does not await, so it makes all its changes in
     ///   the same poll. A drop while it waits for a lock changes nothing:
     ///   the seed can then have the JOIN while this node does not list the
     ///   seed. If a lock never becomes free, the future waits.
-    /// - While the commit waits for the SWIM lock, it holds no view lock, so
-    ///   [`Membership::active_view`] still returns the committed view. As in
-    ///   0.5.87, a commit that demotes holds the active-view lock while it
-    ///   waits for the passive-view lock; `active_view` returns an empty list
-    ///   during that wait.
+    /// - The commit does not hold one of these locks while it waits for
+    ///   another. So view contention does not delay SWIM (an ACK or a
+    ///   probe-timeout write), and SWIM contention does not hide the views:
+    ///   [`Membership::active_view`] returns the committed view while the
+    ///   commit waits for the SWIM or the passive-view lock. While it waits
+    ///   for the active-view lock itself (only when another task holds it),
+    ///   Tokio's fair lock gives the waiting writer the free read permits,
+    ///   so `active_view` returns an empty list until the holders finish, as
+    ///   it does for every writer of the active view in 0.5.87. The
+    ///   exception that bounds the retries: after eight rounds in which some
+    ///   lock was busy, the commit waits for the locks in a fixed order
+    ///   (SWIM state, active view, passive view), holding the earlier ones.
     /// - A dropped future returns no result.
     ///
     /// # Runtime
@@ -1334,35 +1376,131 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
     /// `peer` alive in SWIM.
     ///
     /// It takes every lock that it needs before its first change: the SWIM
-    /// state, the active view, then the passive view (only when a demotion
+    /// state, the active view, and the passive view (only when a demotion
     /// is due). After that it does not await. So a drop, or a runtime
-    /// shutdown, while it waits for a lock changes nothing, and no executor
-    /// can stop it between its first and its last change.
+    /// shutdown, while it waits changes nothing, and no executor can stop
+    /// it between its first and its last change.
     ///
-    /// The SWIM lock comes first so that the active-view lock is not held
-    /// while the commit waits for SWIM: `active_view()` uses `try_read` and
-    /// would return an empty list. No code path holds a view lock while it
-    /// takes the SWIM lock (SWIM never takes a view lock), so this order
-    /// adds no lock cycle. Active before passive is the order that degree
-    /// maintenance also uses.
+    /// It does not hold one of these locks while it waits for another, so
+    /// view contention does not delay SWIM (an ACK, a probe-timeout write)
+    /// and SWIM contention does not hide the views from `try_read` readers
+    /// such as `active_view()`. (A wait for the active-view lock itself
+    /// blocks new readers of that lock, as for every writer: Tokio's lock
+    /// is fair.) Each round takes the locks with `try_write`.
+    /// When one is busy, the round releases what it holds, then waits for
+    /// that one lock alone (in the lock's fair queue) and starts the next
+    /// round holding it. There is no busy wait: a round repeats only after
+    /// a wait in which another holder made progress.
+    ///
+    /// Livelock and starvation: commits are serialized by `commit_gate`, so
+    /// two commits never compete for these locks, and no other holder of
+    /// them retries. A round can only fail when another task takes one of
+    /// the locks in the moment after the commit got the one it waited for.
+    /// The bound: after [`COMMIT_TRY_ROUNDS`] busy rounds, the commit waits
+    /// for the locks in the fixed order (SWIM state, active view, passive
+    /// view), holding the earlier ones. That order has no cycle, so the
+    /// commit then completes once the holders ahead of it are done. Only in
+    /// that case can it hold a lock while it waits for another.
     async fn commit_active(&self, peer: PeerId) {
-        let mut states = self.swim.states.write().await;
-        let mut active = self.active.write().await;
-        // If the active view is full, the first peer in it is demoted.
-        let to_demote = if active.len() >= self.config.active_degree {
+        let _gate = self.commit_gate.lock().await;
+        let mut wait_for = None;
+        let mut busy_rounds = 0;
+        loop {
+            if busy_rounds == COMMIT_TRY_ROUNDS {
+                // The bound: after this many busy rounds, wait for the locks
+                // in the fixed order, holding the earlier ones. This order
+                // has no cycle: no path holds a view lock while it waits for
+                // the SWIM lock, and active before passive is also the order
+                // of degree maintenance.
+                debug!(
+                    peer_id = %peer,
+                    rounds = busy_rounds,
+                    "Active-view commit: locks stayed busy; waiting in lock order"
+                );
+                let mut states = self.swim.states.write().await;
+                let mut active = self.active.write().await;
+                let to_demote = self.demotion(&active);
+                let mut passive = match to_demote {
+                    Some(_) => Some(self.passive.write().await),
+                    None => None,
+                };
+                // Every lock is held. No await from here to the end.
+                self.apply_commit(
+                    &mut states,
+                    &mut active,
+                    passive.as_deref_mut(),
+                    to_demote,
+                    peer,
+                );
+                return;
+            }
+            // Wait for the lock that was busy, holding no other lock.
+            let mut states = None;
+            let mut active = None;
+            let mut passive = None;
+            match wait_for.take() {
+                Some(CommitLock::Swim) => states = Some(self.swim.states.write().await),
+                Some(CommitLock::Active) => active = Some(self.active.write().await),
+                Some(CommitLock::Passive) => passive = Some(self.passive.write().await),
+                None => {}
+            }
+            // Take the others without waiting. A busy lock ends the round:
+            // everything held is released at `continue`.
+            let Some(mut states) = states.or_else(|| self.swim.states.try_write().ok()) else {
+                busy_rounds += 1;
+                wait_for = Some(CommitLock::Swim);
+                continue;
+            };
+            let Some(mut active) = active.or_else(|| self.active.try_write().ok()) else {
+                busy_rounds += 1;
+                wait_for = Some(CommitLock::Active);
+                continue;
+            };
+            let to_demote = self.demotion(&active);
+            let mut passive = match to_demote {
+                Some(_) => match passive.or_else(|| self.passive.try_write().ok()) {
+                    Some(passive) => Some(passive),
+                    None => {
+                        busy_rounds += 1;
+                        wait_for = Some(CommitLock::Passive);
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            // Every lock is held. No await from here to the end.
+            self.apply_commit(
+                &mut states,
+                &mut active,
+                passive.as_deref_mut(),
+                to_demote,
+                peer,
+            );
+            return;
+        }
+    }
+
+    /// The peer that a commit demotes: the first one in a full active view.
+    fn demotion(&self, active: &HashSet<PeerId>) -> Option<PeerId> {
+        if active.len() >= self.config.active_degree {
             active.iter().next().copied()
         } else {
             None
-        };
-        let mut passive = match to_demote {
-            Some(_) => Some(self.passive.write().await),
-            None => None,
-        };
+        }
+    }
 
-        // Every lock is held. No await from here to the end.
+    /// The changes of [`Self::commit_active`], with every lock held.
+    fn apply_commit(
+        &self,
+        states: &mut HashMap<PeerId, SwimPeerEntry>,
+        active: &mut HashSet<PeerId>,
+        passive: Option<&mut HashSet<PeerId>>,
+        to_demote: Option<PeerId>,
+        peer: PeerId,
+    ) {
         if let Some(to_demote) = to_demote {
             active.remove(&to_demote);
-            if let Some(passive) = passive.as_mut() {
+            if let Some(passive) = passive {
                 if passive.len() < self.config.max_passive_degree {
                     passive.insert(to_demote);
                     debug!(peer_id = %to_demote, "Demoted to passive (active view full)");
@@ -1370,10 +1508,7 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
             }
         }
         active.insert(peer);
-        SwimDetector::<T>::set_alive(&mut states, peer);
-        drop(states);
-        drop(passive);
-        drop(active);
+        SwimDetector::<T>::set_alive(states, peer);
         debug!(peer_id = %peer, "Added to active view");
     }
 

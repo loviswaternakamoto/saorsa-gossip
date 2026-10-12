@@ -1325,6 +1325,64 @@ async fn the_active_view_stays_readable_while_a_demoting_commit_waits_for_the_pa
     assert_eq!(membership.passive_view().len(), 1);
 }
 
+/// The retry bound of the commit. Another holder takes the SWIM lock and
+/// the active-view lock in turn, so that each round of `add_active(P)` finds
+/// one busy just after it got the other. While the rounds go on, the commit
+/// never holds a lock while it waits: the test can always take the free
+/// one. After eight busy rounds the commit waits in the fixed order: it
+/// takes the free SWIM lock and waits for the active view while it holds
+/// it. Once the holder lets go, the commit completes.
+#[tokio::test(start_paused = true)]
+async fn a_commit_that_keeps_finding_a_lock_busy_waits_in_lock_order_after_eight_rounds() {
+    let (membership, _transport) = membership(Script::default());
+    let membership = Arc::new(membership);
+    // Let the background tasks run their first ticks.
+    tokio::time::sleep(ms(1)).await;
+    let swim_lock = Arc::clone(&membership.swim.states);
+    let active_lock = Arc::clone(&membership.active);
+    let mut swim_guard = Some(Arc::clone(&swim_lock).try_write_owned().unwrap());
+    let mut active_guard = None;
+    let adder = {
+        let membership = Arc::clone(&membership);
+        tokio::spawn(async move { membership.add_active(peer(5)).await })
+    };
+    // Round 1 finds the SWIM lock busy.
+    tokio::time::sleep(ms(1)).await;
+    for round in 2..=8 {
+        if round % 2 == 0 {
+            // The commit gets SWIM and finds the active view busy.
+            active_guard = Some(
+                Arc::clone(&active_lock)
+                    .try_write_owned()
+                    .expect("the commit holds no lock while it waits"),
+            );
+            swim_guard = None;
+        } else {
+            // The commit gets the active view and finds SWIM busy.
+            swim_guard = Some(
+                Arc::clone(&swim_lock)
+                    .try_write_owned()
+                    .expect("the commit holds no lock while it waits"),
+            );
+            active_guard = None;
+        }
+        tokio::time::sleep(ms(1)).await;
+        assert!(!adder.is_finished(), "round {round}: the commit waits");
+    }
+    // After round 8 the test holds the active view; the commit waits in
+    // lock order and holds the SWIM lock meanwhile.
+    assert!(swim_guard.is_none() && active_guard.is_some());
+    assert!(
+        swim_lock.try_read().is_err(),
+        "after eight busy rounds the commit holds SWIM while it waits for the active view"
+    );
+
+    drop(active_guard);
+    adder.await.unwrap().unwrap();
+    assert_eq!(membership.active_view(), vec![peer(5)]);
+    assert_eq!(swim_state(&membership, peer(5)), Some(PeerState::Alive));
+}
+
 /// The time from now until `at`, in milliseconds.
 fn millis_until(at: TokioInstant) -> u64 {
     at.duration_since(TokioInstant::now()).as_millis() as u64

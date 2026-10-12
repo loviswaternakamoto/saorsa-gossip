@@ -32,13 +32,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   locks before its first change and does not await after that, so neither a
   drop nor a runtime shutdown leaves the views half updated. A drop while it
   waits for a lock changes nothing; the seed can then have the JOIN frame. It
-  takes the SWIM lock before the view locks, so `active_view()` does not
-  read as empty while it waits for SWIM.
+  does not hold one of its locks (SWIM state, active view, passive view)
+  while it waits for another: it takes them with `try_write`, and when one is
+  busy it releases the others and waits for that one alone. So view
+  contention does not delay SWIM, and `active_view()` does not read as empty
+  while a commit waits. After eight busy rounds it waits in the fixed order,
+  which bounds the retries.
   `Membership::join` keeps its signature and behaviour and now runs on these
   steps; a differential test compares it frame for frame, side effect for
   side effect and backoff for backoff with a verbatim copy of the 0.5.87 loop
   and `add_active`. As in 0.5.87, its success path needs no entered Tokio
   runtime; its backoff sleeps use a Tokio timer. See ADR-015.
+
+### Fixed
+
+- **membership: an on-time SWIM ACK no longer loses to the probe timeout.**
+  The probe-timeout task scans the pending probes and then takes the SWIM
+  state lock. An ACK that arrived between the two still had its sender
+  marked Suspect. The task now re-checks, with the state lock held, that the
+  same probe is still pending, and `handle_ack` / `handle_ack_response` clear
+  the probe before they mark the peer alive. So an ACK is either seen by the
+  re-check or marks the peer alive after the timeout's write. The re-check
+  does not wait for the probe table while it holds the state lock; when the
+  table is busy, the next scan decides.
 
 ## [0.5.87] - 2026-10-04
 
