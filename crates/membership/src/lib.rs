@@ -414,6 +414,11 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
     /// Mark a peer as alive
     pub async fn mark_alive(&self, peer: PeerId) {
         let mut states = self.states.write().await;
+        Self::set_alive(&mut states, peer);
+    }
+
+    /// Mark `peer` alive in a state table that the caller has locked.
+    fn set_alive(states: &mut HashMap<PeerId, SwimPeerEntry>, peer: PeerId) {
         states.insert(
             peer,
             SwimPeerEntry {
@@ -1267,8 +1272,17 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
     /// When the peer that answered loses its connection before the caller
     /// sends the JOIN frame, report it with [`JoinLedger::record_loss`].
     ///
-    /// Cancel safety: the future can be dropped. The attempt then counts,
-    /// and the backoff does not change.
+    /// # Cancel safety
+    ///
+    /// The future can be dropped. The attempt then counts, and the backoff
+    /// does not change.
+    ///
+    /// # Runtime
+    ///
+    /// `join_dial` spawns no task and starts no timer; it reads
+    /// `tokio::time::Instant::now`, which works outside a runtime. The
+    /// transport's dial can have its own needs. [`Membership::join`] sleeps
+    /// for its backoff after a failed dial with a Tokio timer, as in 0.5.87.
     pub async fn join_dial(&self, ledger: &mut JoinLedger, seed: std::net::SocketAddr) -> JoinDial {
         self.join_dial_labelled(ledger, seed, &seed).await
     }
@@ -1279,52 +1293,77 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
     ///
     /// # Errors
     ///
-    /// Returns the error of adding the seed to the active view.
-    /// [`Membership::join`] ends the JOIN with this error.
+    /// Returns the error of [`Membership::add_active`] (the current
+    /// implementation returns none). [`Membership::join`] ends the JOIN
+    /// with this error.
     ///
-    /// Cancel safety: the future can be dropped at any point.
-    /// - Before the JOIN frame is sent, only the stored address remains.
-    /// - Once the frame is sent, the local commit (the active-view insert,
-    ///   with a demotion to the passive view when the active view is full,
-    ///   and the SWIM alive mark) runs to completion in its own task, even
-    ///   if this future is dropped. A drop never leaves the views or the
-    ///   SWIM state half updated. The seed may have the JOIN already.
+    /// # Cancel safety
+    ///
+    /// The future can be dropped at any point, and a runtime shutdown drops
+    /// it in the same way. It never leaves the active view, the passive
+    /// view or the SWIM state half updated:
+    /// - Until the transport's send returns `Ok`, the only change is the
+    ///   stored address. The transport can have sent some or all of the
+    ///   frame before a drop, so the seed can have the JOIN.
+    /// - Then the local commit (the active-view insert, a demotion to the
+    ///   passive view when the active view is full, and the SWIM alive mark)
+    ///   takes every lock that it needs before its first change: the active
+    ///   view, the passive view when a demotion is due, then the SWIM state.
+    ///   After that it does not await, so it makes all its changes in the
+    ///   same poll. A drop while it waits for a lock changes nothing: the
+    ///   seed can then have the JOIN while this node does not list the seed.
+    ///   If a lock never becomes free, the future waits.
+    /// - A dropped future returns no result.
+    ///
+    /// # Runtime
+    ///
+    /// `join_send` spawns no task and starts no timer, so it runs on any
+    /// executor. The transport's send can have its own needs.
     pub async fn join_send(&self, seed: std::net::SocketAddr, peer: PeerId) -> Result<JoinSend> {
         self.join_send_labelled(seed, peer, &seed).await
     }
 
-    /// The body of [`Membership::add_active`], on owned handles so that
-    /// [`Self::join_send`] can run it in its own task.
-    async fn add_active_parts(
-        active: Arc<RwLock<HashSet<PeerId>>>,
-        passive: Arc<RwLock<HashSet<PeerId>>>,
-        swim: Arc<SwimDetector<T>>,
-        active_degree: usize,
-        max_passive_degree: usize,
-        peer: PeerId,
-    ) -> Result<()> {
-        let mut active = active.write().await;
+    /// The body of [`Membership::add_active`], and the local commit of
+    /// [`Self::join_send`]: add `peer` to the active view (when the view is
+    /// full, demote one peer to the passive view, as in 0.5.87) and mark
+    /// `peer` alive in SWIM.
+    ///
+    /// It takes every lock that it needs before its first change, in the
+    /// usual order: the active view, the passive view (only when a demotion
+    /// is due), then the SWIM state. After that it does not await. So a
+    /// drop, or a runtime shutdown, while it waits for a lock changes
+    /// nothing, and no executor can stop it between its first and its last
+    /// change.
+    async fn commit_active(&self, peer: PeerId) {
+        let mut active = self.active.write().await;
+        // If the active view is full, the first peer in it is demoted.
+        let to_demote = if active.len() >= self.config.active_degree {
+            active.iter().next().copied()
+        } else {
+            None
+        };
+        let mut passive = match to_demote {
+            Some(_) => Some(self.passive.write().await),
+            None => None,
+        };
+        let mut states = self.swim.states.write().await;
 
-        // If active view is full, demote one peer to passive
-        if active.len() >= active_degree {
-            if let Some(&to_demote) = active.iter().next() {
-                active.remove(&to_demote);
-                // Move to passive view
-                let mut passive = passive.write().await;
-                if passive.len() < max_passive_degree {
+        // Every lock is held. No await from here to the end.
+        if let Some(to_demote) = to_demote {
+            active.remove(&to_demote);
+            if let Some(passive) = passive.as_mut() {
+                if passive.len() < self.config.max_passive_degree {
                     passive.insert(to_demote);
                     debug!(peer_id = %to_demote, "Demoted to passive (active view full)");
                 }
             }
         }
-
         active.insert(peer);
-        drop(active); // Release lock before async call
-
-        swim.mark_alive(peer).await;
+        SwimDetector::<T>::set_alive(&mut states, peer);
+        drop(states);
+        drop(passive);
+        drop(active);
         debug!(peer_id = %peer, "Added to active view");
-
-        Ok(())
     }
 
     /// [`Self::join_dial`], with `label` as the `seed` field of its logs.
@@ -1410,21 +1449,10 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
             return Ok(JoinSend::SendFailed);
         }
 
-        // Add seed to active view immediately (optimistic). The frame is
-        // out, so this local commit runs in its own task: dropping this
-        // future cannot leave the views or the SWIM state half updated.
-        let commit = tokio::spawn(Self::add_active_parts(
-            Arc::clone(&self.active),
-            Arc::clone(&self.passive),
-            Arc::clone(&self.swim),
-            self.config.active_degree,
-            self.config.max_passive_degree,
-            seed_peer_id,
-        ));
-        match commit.await {
-            Ok(result) => result?,
-            Err(e) => return Err(anyhow!("JOIN: active view update did not complete: {}", e)),
-        }
+        // Add seed to active view immediately (optimistic). The commit
+        // takes all its locks before its first change, so a drop cannot
+        // leave the views or the SWIM state half updated.
+        self.add_active(seed_peer_id).await?;
         debug!(seed = %label, "JOIN: Successfully joined network");
         Ok(JoinSend::Joined)
     }
@@ -2046,15 +2074,8 @@ impl<T: GossipTransport + 'static> Membership for HyParViewMembership<T> {
     }
 
     async fn add_active(&self, peer: PeerId) -> Result<()> {
-        Self::add_active_parts(
-            Arc::clone(&self.active),
-            Arc::clone(&self.passive),
-            Arc::clone(&self.swim),
-            self.config.active_degree,
-            self.config.max_passive_degree,
-            peer,
-        )
-        .await
+        self.commit_active(peer).await;
+        Ok(())
     }
 
     async fn remove_active(&self, peer: PeerId) -> Result<()> {

@@ -3,11 +3,12 @@
 //! [`Membership::join`], which now runs on it.
 //!
 //! The differential tests run a verbatim copy of the 0.5.87 `join` loop
-//! ([`reference_join_0_5_87`]) and the current [`Membership::join`] against
-//! the same scripted transport, and compare the dials, the JOIN frames, the
-//! stored addresses, the active view, the SWIM state, the result and the
-//! backoff between dials. All tests use paused time and a scripted
-//! transport: no sockets.
+//! ([`reference_join_0_5_87`], with its `add_active`,
+//! [`reference_add_active_0_5_87`]) and the current [`Membership::join`]
+//! against the same scripted transport, and compare the dials, the JOIN
+//! frames, the stored addresses, the active view, the SWIM state, the result
+//! and the backoff between dials. The tests use paused time (or a plain
+//! thread) and a scripted transport: no sockets.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -294,7 +295,7 @@ async fn reference_join_0_5_87<T: GossipTransport + 'static>(
                     }
 
                     // Add seed to active view immediately (optimistic)
-                    this.add_active(seed_peer_id).await?;
+                    reference_add_active_0_5_87(this, seed_peer_id).await?;
                     connected = true;
                     break;
                 }
@@ -324,6 +325,37 @@ async fn reference_join_0_5_87<T: GossipTransport + 'static>(
     }
 
     Err(anyhow!("JOIN: Failed to connect to any seed nodes"))
+}
+
+/// A verbatim copy of `Membership::add_active` from
+/// saorsa-gossip-membership 0.5.87 (`src/lib.rs:1741-1764` of that
+/// release), on `this` instead of `self`.
+async fn reference_add_active_0_5_87<T: GossipTransport + 'static>(
+    this: &HyParViewMembership<T>,
+    peer: PeerId,
+) -> Result<()> {
+    let mut active = this.active.write().await;
+
+    // If active view is full, demote one peer to passive
+    if active.len() >= this.config.active_degree {
+        if let Some(&to_demote) = active.iter().next() {
+            active.remove(&to_demote);
+            // Move to passive view
+            let mut passive = this.passive.write().await;
+            if passive.len() < this.config.max_passive_degree {
+                passive.insert(to_demote);
+                debug!(peer_id = %to_demote, "Demoted to passive (active view full)");
+            }
+        }
+    }
+
+    active.insert(peer);
+    drop(active); // Release lock before async call
+
+    this.swim.mark_alive(peer).await;
+    debug!(peer_id = %peer, "Added to active view");
+
+    Ok(())
 }
 
 /// Everything a JOIN run leaves behind that the tests compare.
@@ -840,9 +872,10 @@ async fn an_early_dial_is_refused_without_using_an_attempt() {
 /// Codex re-review of a2100a7, finding 2: a dropped `join_send` does not
 /// leave a half-updated view. The active view is full and another task
 /// holds the passive-view lock. The send is dropped after the JOIN frame
-/// went out, while the local commit waits for that lock. Once the lock is
-/// free, the view is consistent: the new peer is active, the demoted peer is
-/// passive (no peer is lost), and the new peer is alive in SWIM.
+/// went out, while the local commit waits for that lock. The commit takes
+/// every lock before its first change, so nothing changed: no peer is lost,
+/// and the new peer is neither active nor alive. (At a2100a7 the demoted
+/// peer was in neither view.)
 #[tokio::test(start_paused = true)]
 async fn a_dropped_send_leaves_a_consistent_view_when_the_passive_lock_is_held() {
     let joining = peer(99);
@@ -881,9 +914,6 @@ async fn a_dropped_send_leaves_a_consistent_view_when_the_passive_lock_is_held()
 
     let active = membership.active_view();
     let passive = membership.passive_view();
-    assert_eq!(active.len(), DEFAULT_ACTIVE_DEGREE, "active {active:?}");
-    assert!(active.contains(&joining), "the new peer is active");
-    assert_eq!(passive.len(), 1, "the demoted peer is passive: {passive:?}");
     for existing in &before {
         assert!(
             active.contains(existing) || passive.contains(existing),
@@ -891,15 +921,22 @@ async fn a_dropped_send_leaves_a_consistent_view_when_the_passive_lock_is_held()
         );
     }
     assert_eq!(
-        membership.swim().get_state(&joining).await,
-        Some(PeerState::Alive)
+        sorted(active),
+        sorted(before),
+        "the active view is unchanged"
     );
+    assert!(
+        passive.is_empty(),
+        "the passive view is unchanged: {passive:?}"
+    );
+    assert_eq!(membership.swim().get_state(&joining).await, None);
 }
 
 /// Codex re-review of a2100a7, finding 2, second boundary: the send is
-/// dropped while the local commit waits for the SWIM state lock (after the
-/// active-view insert). Once the lock is free, the new peer is active and
-/// alive in SWIM.
+/// dropped while the local commit waits for the SWIM state lock. The new
+/// peer must be active only if it is alive in SWIM. The commit takes every
+/// lock before its first change, so nothing changed: the new peer is
+/// neither active nor alive. (At a2100a7 it was active and not alive.)
 #[tokio::test(start_paused = true)]
 async fn a_dropped_send_leaves_a_consistent_view_when_the_swim_lock_is_held() {
     let joining = peer(99);
@@ -930,11 +967,51 @@ async fn a_dropped_send_leaves_a_consistent_view_when_the_swim_lock_is_held() {
     drop(swim_guard);
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    assert!(membership.active_view().contains(&joining));
-    assert_eq!(
-        membership.swim().get_state(&joining).await,
-        Some(PeerState::Alive)
-    );
+    let active = membership.active_view().contains(&joining);
+    let alive = membership.swim().get_state(&joining).await == Some(PeerState::Alive);
+    assert_eq!(active, alive, "active {active}, alive {alive}");
+    assert!(!active, "the commit did not start its changes");
+}
+
+/// The commit with a full active view has the same effect as the 0.5.87
+/// `add_active`: one peer is demoted to the passive view, the new peer is
+/// active and alive, and no peer is lost. (The two runs can demote
+/// different peers: each view is a `HashSet` with its own hash seed.)
+#[tokio::test(start_paused = true)]
+async fn a_full_active_view_demotes_one_peer_as_in_0_5_87() {
+    let joining = peer(99);
+    let before: Vec<PeerId> = (1..=DEFAULT_ACTIVE_DEGREE as u8).map(peer).collect();
+    let mut views = Vec::new();
+    for reference in [true, false] {
+        let (membership, _transport) = membership(Script::default());
+        for existing in &before {
+            membership.add_active(*existing).await.unwrap();
+        }
+        if reference {
+            reference_add_active_0_5_87(&membership, joining)
+                .await
+                .unwrap();
+        } else {
+            membership.add_active(joining).await.unwrap();
+        }
+        let active = membership.active_view();
+        let passive = membership.passive_view();
+        assert_eq!(active.len(), DEFAULT_ACTIVE_DEGREE);
+        assert!(active.contains(&joining));
+        assert_eq!(passive.len(), 1);
+        let mut all = active.clone();
+        all.extend(passive.iter().copied());
+        assert_eq!(
+            sorted(all),
+            sorted([before.clone(), vec![joining]].concat())
+        );
+        views.push((
+            active.len(),
+            passive.len(),
+            membership.swim().get_state(&joining).await,
+        ));
+    }
+    assert_eq!(views[0], views[1]);
 }
 
 /// The SWIM state of `peer`, read without awaiting (the caller holds no

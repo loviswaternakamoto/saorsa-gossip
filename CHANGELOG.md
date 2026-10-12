@@ -27,12 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that answered dials do not reset (x0x D252). `JoinLedger::ready_at(seed)` is
   the later of the dial backoff and the loss cooldown; `join_dial` makes no
   dial before it (`JoinDial::NotReady`, no attempt used). Both steps are safe
-  to drop: once the JOIN frame is sent, the local commit (active view, passive
-  demotion, SWIM alive mark) runs to completion in its own task, so a drop
-  never leaves the views half updated. `Membership::join` keeps its signature
-  and behaviour and now runs on these steps; a differential test compares it
-  frame for frame, side effect for side effect and backoff for backoff with a
-  verbatim copy of the 0.5.87 loop. See ADR-015.
+  to drop and spawn no task. The local commit (active view, passive demotion,
+  SWIM alive mark; also the body of `Membership::add_active`) takes all its
+  locks before its first change and does not await after that, so neither a
+  drop nor a runtime shutdown leaves the views half updated. A drop while it
+  waits for a lock changes nothing; the seed can then have the JOIN frame.
+  `Membership::join` keeps its signature and behaviour and now runs on these
+  steps; a differential test compares it frame for frame, side effect for
+  side effect and backoff for backoff with a verbatim copy of the 0.5.87 loop
+  and `add_active`. As in 0.5.87, its success path needs no entered Tokio
+  runtime; its backoff sleeps use a Tokio timer. See ADR-015.
 
 ## [0.5.87] - 2026-10-04
 
