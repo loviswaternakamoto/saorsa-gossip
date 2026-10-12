@@ -136,7 +136,11 @@ impl GossipTransport for ScriptedTransport {
                 .copied()
                 .unwrap_or_else(fails)
         };
-        tokio::time::sleep(dial.took).await;
+        // No timer for an instant dial, so that a JOIN can run outside a
+        // Tokio runtime.
+        if !dial.took.is_zero() {
+            tokio::time::sleep(dial.took).await;
+        }
         dial.answer
             .ok_or_else(|| anyhow!("scripted dial failure to {addr}"))
     }
@@ -170,7 +174,9 @@ impl GossipTransport for ScriptedTransport {
                 .copied()
                 .unwrap_or(true)
         };
-        tokio::time::sleep(self.script.join_send_took).await;
+        if !self.script.join_send_took.is_zero() {
+            tokio::time::sleep(self.script.join_send_took).await;
+        }
         if !sent {
             return Err(anyhow!("scripted JOIN send failure to {peer}"));
         }
@@ -929,6 +935,126 @@ async fn a_dropped_send_leaves_a_consistent_view_when_the_swim_lock_is_held() {
         membership.swim().get_state(&joining).await,
         Some(PeerState::Alive)
     );
+}
+
+/// The SWIM state of `peer`, read without awaiting (the caller holds no
+/// SWIM lock).
+fn swim_state<T: GossipTransport + 'static>(
+    membership: &HyParViewMembership<T>,
+    peer: PeerId,
+) -> Option<PeerState> {
+    membership
+        .swim
+        .states
+        .try_read()
+        .expect("no other holder of the SWIM state lock")
+        .get(&peer)
+        .map(|entry| entry.state)
+}
+
+fn sorted(mut peers: Vec<PeerId>) -> Vec<PeerId> {
+    peers.sort_by_key(|peer| peer.to_bytes());
+    peers
+}
+
+/// Poll `future` to completion on this thread, outside any Tokio runtime
+/// context.
+fn poll_outside_runtime<F: std::future::Future>(future: F) -> F::Output {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    assert!(
+        tokio::runtime::Handle::try_current().is_err(),
+        "scenario: no Tokio runtime is entered on this thread"
+    );
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut context) {
+            return output;
+        }
+        std::thread::park();
+    }
+}
+
+/// Codex re-review of afabe92, finding 3: the legacy `Membership::join`
+/// must not need an entered Tokio runtime on its success path; the 0.5.87
+/// loop did not. The membership is built inside a runtime (its background
+/// tasks need one). Then an all-ready JOIN is polled on a plain thread.
+#[test]
+fn legacy_join_succeeds_when_polled_outside_a_runtime() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (membership, transport) = runtime.block_on(async {
+        membership(Script {
+            dials: HashMap::from([(addr(A), vec![answers(peer(1))])]),
+            ..Script::default()
+        })
+    });
+
+    let result = poll_outside_runtime(membership.join(vec![addr(A).to_string()]));
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(transport.join_frames().len(), 1);
+    assert_eq!(membership.active_view(), vec![peer(1)]);
+    assert_eq!(swim_state(&membership, peer(1)), Some(PeerState::Alive));
+    drop(runtime);
+}
+
+/// Codex re-review of afabe92, finding 3: the runtime that drives a
+/// `join_send` shuts down while the local commit waits for a lock. The
+/// active view is full and another holder keeps the passive-view lock. The
+/// JOIN frame goes out, then the runtime shuts down. The views and the SWIM
+/// state must be as before: no peer is lost, and the new peer is neither
+/// active nor alive.
+#[test]
+fn a_runtime_shutdown_during_the_local_commit_leaves_the_views_unchanged() {
+    let joining = peer(99);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let (membership, transport) = runtime.block_on(async {
+        membership(Script {
+            dials: HashMap::from([(addr(A), vec![answers(joining)])]),
+            ..Script::default()
+        })
+    });
+    let membership = Arc::new(membership);
+    let before: Vec<PeerId> = (1..=DEFAULT_ACTIVE_DEGREE as u8).map(peer).collect();
+    runtime.block_on(async {
+        for existing in &before {
+            membership.add_active(*existing).await.unwrap();
+        }
+    });
+    let passive_guard = runtime.block_on(Arc::clone(&membership.passive).write_owned());
+    let sender = Arc::clone(&membership);
+    let _send = runtime.spawn(async move {
+        let mut ledger = JoinLedger::new();
+        let _ = sender.join_dial(&mut ledger, addr(A)).await;
+        sender.join_send(addr(A), joining).await
+    });
+    // The send runs until its local commit waits for the passive lock.
+    runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
+    assert_eq!(
+        transport.join_frames().len(),
+        1,
+        "scenario: the JOIN frame went out"
+    );
+
+    drop(runtime);
+    drop(passive_guard);
+
+    assert_eq!(sorted(membership.active_view()), sorted(before));
+    assert!(membership.passive_view().is_empty());
+    assert_eq!(swim_state(&membership, joining), None);
 }
 
 /// The time from now until `at`, in milliseconds.
