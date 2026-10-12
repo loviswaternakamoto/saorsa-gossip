@@ -798,3 +798,103 @@ async fn the_last_attempt_is_reported_and_then_no_dial() {
     );
     assert_eq!(transport.dial_addrs().len(), JOIN_MAX_ATTEMPTS);
 }
+
+/// Codex re-review of a2100a7, finding 2: a dropped `join_send` does not
+/// leave a half-updated view. The active view is full and another task
+/// holds the passive-view lock. The send is dropped after the JOIN frame
+/// went out, while the local commit waits for that lock. Once the lock is
+/// free, the view is consistent: the new peer is active, the demoted peer is
+/// passive (no peer is lost), and the new peer is alive in SWIM.
+#[tokio::test(start_paused = true)]
+async fn a_dropped_send_leaves_a_consistent_view_when_the_passive_lock_is_held() {
+    let joining = peer(99);
+    let (membership, transport) = membership(Script {
+        dials: HashMap::from([(addr(A), vec![answers(joining)])]),
+        ..Script::default()
+    });
+    let before: Vec<PeerId> = (1..=DEFAULT_ACTIVE_DEGREE as u8).map(peer).collect();
+    for existing in &before {
+        membership.add_active(*existing).await.unwrap();
+    }
+    assert_eq!(membership.active_view().len(), DEFAULT_ACTIVE_DEGREE);
+
+    let passive_guard = membership.passive.write().await;
+    let mut ledger = JoinLedger::new();
+    assert_eq!(
+        membership.join_dial(&mut ledger, addr(A)).await,
+        JoinDial::Answered(joining)
+    );
+    let send = tokio::time::timeout(
+        Duration::from_secs(1),
+        membership.join_send(addr(A), joining),
+    )
+    .await;
+    assert!(
+        send.is_err(),
+        "scenario: the send is dropped while its local commit waits for the passive lock"
+    );
+    assert_eq!(
+        transport.join_frames().len(),
+        1,
+        "scenario: the JOIN frame went out"
+    );
+    drop(passive_guard);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let active = membership.active_view();
+    let passive = membership.passive_view();
+    assert_eq!(active.len(), DEFAULT_ACTIVE_DEGREE, "active {active:?}");
+    assert!(active.contains(&joining), "the new peer is active");
+    assert_eq!(passive.len(), 1, "the demoted peer is passive: {passive:?}");
+    for existing in &before {
+        assert!(
+            active.contains(existing) || passive.contains(existing),
+            "peer {existing} is in neither view"
+        );
+    }
+    assert_eq!(
+        membership.swim().get_state(&joining).await,
+        Some(PeerState::Alive)
+    );
+}
+
+/// Codex re-review of a2100a7, finding 2, second boundary: the send is
+/// dropped while the local commit waits for the SWIM state lock (after the
+/// active-view insert). Once the lock is free, the new peer is active and
+/// alive in SWIM.
+#[tokio::test(start_paused = true)]
+async fn a_dropped_send_leaves_a_consistent_view_when_the_swim_lock_is_held() {
+    let joining = peer(99);
+    let (membership, transport) = membership(Script {
+        dials: HashMap::from([(addr(A), vec![answers(joining)])]),
+        ..Script::default()
+    });
+    let swim_guard = membership.swim.states.write().await;
+    let mut ledger = JoinLedger::new();
+    assert_eq!(
+        membership.join_dial(&mut ledger, addr(A)).await,
+        JoinDial::Answered(joining)
+    );
+    let send = tokio::time::timeout(
+        Duration::from_secs(1),
+        membership.join_send(addr(A), joining),
+    )
+    .await;
+    assert!(
+        send.is_err(),
+        "scenario: the send is dropped while its local commit waits for the SWIM lock"
+    );
+    assert_eq!(
+        transport.join_frames().len(),
+        1,
+        "scenario: the JOIN frame went out"
+    );
+    drop(swim_guard);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    assert!(membership.active_view().contains(&joining));
+    assert_eq!(
+        membership.swim().get_state(&joining).await,
+        Some(PeerState::Alive)
+    );
+}
