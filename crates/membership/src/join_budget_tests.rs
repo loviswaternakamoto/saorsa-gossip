@@ -1134,6 +1134,41 @@ fn a_runtime_shutdown_during_the_local_commit_leaves_the_views_unchanged() {
     assert_eq!(swim_state(&membership, joining), None);
 }
 
+/// Codex re-review of 24eb1c4, finding 1: a commit that waits for the SWIM
+/// lock must not hide the active view. `active_view()` uses `try_read` and
+/// returns an empty list when the active-view lock is held, so a
+/// coordinator advert or a FOAF lookup that reads it then would send
+/// nothing. The view holds A and has room; another holder keeps the SWIM
+/// lock while `add_active(B)` waits. Readers must still see [A]. Once the
+/// lock is free, B is active and alive.
+#[tokio::test(start_paused = true)]
+async fn the_active_view_stays_readable_while_a_commit_waits_for_the_swim_lock() {
+    let (membership, _transport) = membership(Script::default());
+    membership.add_active(peer(1)).await.unwrap();
+    let membership = Arc::new(membership);
+    let swim_guard = Arc::clone(&membership.swim.states).write_owned().await;
+    let adder = {
+        let membership = Arc::clone(&membership);
+        tokio::spawn(async move { membership.add_active(peer(2)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(
+        !adder.is_finished(),
+        "scenario: add_active(B) waits for the SWIM lock"
+    );
+
+    assert_eq!(membership.active_view(), vec![peer(1)]);
+    assert!(membership.passive_view().is_empty());
+
+    drop(swim_guard);
+    adder.await.unwrap().unwrap();
+    assert_eq!(
+        sorted(membership.active_view()),
+        sorted(vec![peer(1), peer(2)])
+    );
+    assert_eq!(swim_state(&membership, peer(2)), Some(PeerState::Alive));
+}
+
 /// The time from now until `at`, in milliseconds.
 fn millis_until(at: TokioInstant) -> u64 {
     at.duration_since(TokioInstant::now()).as_millis() as u64
