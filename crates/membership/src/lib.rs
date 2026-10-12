@@ -1307,12 +1307,17 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
     ///   frame before a drop, so the seed can have the JOIN.
     /// - Then the local commit (the active-view insert, a demotion to the
     ///   passive view when the active view is full, and the SWIM alive mark)
-    ///   takes every lock that it needs before its first change: the active
-    ///   view, the passive view when a demotion is due, then the SWIM state.
-    ///   After that it does not await, so it makes all its changes in the
-    ///   same poll. A drop while it waits for a lock changes nothing: the
-    ///   seed can then have the JOIN while this node does not list the seed.
-    ///   If a lock never becomes free, the future waits.
+    ///   takes every lock that it needs before its first change: the SWIM
+    ///   state, the active view, then the passive view when a demotion is
+    ///   due. After that it does not await, so it makes all its changes in
+    ///   the same poll. A drop while it waits for a lock changes nothing:
+    ///   the seed can then have the JOIN while this node does not list the
+    ///   seed. If a lock never becomes free, the future waits.
+    /// - While the commit waits for the SWIM lock, it holds no view lock, so
+    ///   [`Membership::active_view`] still returns the committed view. As in
+    ///   0.5.87, a commit that demotes holds the active-view lock while it
+    ///   waits for the passive-view lock; `active_view` returns an empty list
+    ///   during that wait.
     /// - A dropped future returns no result.
     ///
     /// # Runtime
@@ -1328,13 +1333,20 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
     /// full, demote one peer to the passive view, as in 0.5.87) and mark
     /// `peer` alive in SWIM.
     ///
-    /// It takes every lock that it needs before its first change, in the
-    /// usual order: the active view, the passive view (only when a demotion
-    /// is due), then the SWIM state. After that it does not await. So a
-    /// drop, or a runtime shutdown, while it waits for a lock changes
-    /// nothing, and no executor can stop it between its first and its last
-    /// change.
+    /// It takes every lock that it needs before its first change: the SWIM
+    /// state, the active view, then the passive view (only when a demotion
+    /// is due). After that it does not await. So a drop, or a runtime
+    /// shutdown, while it waits for a lock changes nothing, and no executor
+    /// can stop it between its first and its last change.
+    ///
+    /// The SWIM lock comes first so that the active-view lock is not held
+    /// while the commit waits for SWIM: `active_view()` uses `try_read` and
+    /// would return an empty list. No code path holds a view lock while it
+    /// takes the SWIM lock (SWIM never takes a view lock), so this order
+    /// adds no lock cycle. Active before passive is the order that degree
+    /// maintenance also uses.
     async fn commit_active(&self, peer: PeerId) {
+        let mut states = self.swim.states.write().await;
         let mut active = self.active.write().await;
         // If the active view is full, the first peer in it is demoted.
         let to_demote = if active.len() >= self.config.active_degree {
@@ -1346,7 +1358,6 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
             Some(_) => Some(self.passive.write().await),
             None => None,
         };
-        let mut states = self.swim.states.write().await;
 
         // Every lock is held. No await from here to the end.
         if let Some(to_demote) = to_demote {

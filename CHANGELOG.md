@@ -31,7 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SWIM alive mark; also the body of `Membership::add_active`) takes all its
   locks before its first change and does not await after that, so neither a
   drop nor a runtime shutdown leaves the views half updated. A drop while it
-  waits for a lock changes nothing; the seed can then have the JOIN frame.
+  waits for a lock changes nothing; the seed can then have the JOIN frame. It
+  takes the SWIM lock before the view locks, so `active_view()` does not
+  read as empty while it waits for SWIM.
   `Membership::join` keeps its signature and behaviour and now runs on these
   steps; a differential test compares it frame for frame, side effect for
   side effect and backoff for backoff with a verbatim copy of the 0.5.87 loop
