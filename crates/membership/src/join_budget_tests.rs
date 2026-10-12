@@ -1200,25 +1200,50 @@ fn ms(millis: u64) -> Duration {
     Duration::from_millis(millis)
 }
 
-/// Codex re-review of 43af9eb, finding 1 (real time): SWIM progress must
-/// not wait for view-lock contention. The probe to P is sent at 490 ms, so
-/// its deadline is 990 ms and the scan at 1000 ms finds it late. A view
-/// holder keeps the active-view lock from 900 ms to 1100 ms, across that
-/// scan, and `add_active(Q)` waits for the lock. P's ACK arrives at 940 ms,
-/// before the deadline. The ACK must complete at once and P must stay
-/// alive. At 43af9eb the commit held the SWIM state lock while it waited:
-/// the ACK queued behind it, and the queued timeout write then overwrote
-/// Alive with Suspect.
-#[tokio::test]
-async fn an_on_time_ack_wins_while_a_commit_waits_for_a_view_lock() {
+/// Let all ready tasks run. With a paused clock the runtime runs every
+/// ready task before it moves the clock by this 1 ms.
+async fn settle() {
+    tokio::time::sleep(ms(1)).await;
+}
+
+/// Record a probe to `peer` that is already overdue. SWIM's timeout reads
+/// the std clock (`std::time::Instant`), which a paused Tokio clock does not
+/// move, so the probe is backdated on that clock instead.
+async fn record_overdue_probe<T: GossipTransport + 'static>(
+    membership: &HyParViewMembership<T>,
+    peer: PeerId,
+) {
+    let sent = Instant::now()
+        .checked_sub(ms(10 * SWIM_ACK_TIMEOUT_MS))
+        .expect("the std clock is past five seconds");
+    membership
+        .swim
+        .pending_probes
+        .write()
+        .await
+        .insert(peer, sent);
+}
+
+/// Codex re-review of 43af9eb, finding 1: SWIM progress must not wait for
+/// view-lock contention. Deterministic: a paused clock drives the timeout
+/// scans (every 500 ms of Tokio time), the probe is backdated, and lock
+/// guards set the order. P has an overdue probe; the next scan runs at
+/// 1000 ms. A view holder keeps the active-view lock across that scan, and
+/// `add_active(Q)` waits for it. P's ACK arrives at 950 ms, before the
+/// scan. The ACK must complete at once and P must stay alive. At 43af9eb
+/// the commit held the SWIM state lock while it waited: the ACK queued
+/// behind it, and the queued timeout write then turned Alive into Suspect.
+#[tokio::test(start_paused = true)]
+async fn an_ack_before_the_scan_wins_while_a_commit_waits_for_a_view_lock() {
     let (membership, _transport) = membership(Script::default());
     let membership = Arc::new(membership);
     let t0 = background_tasks_started().await;
     let target = peer(7);
 
-    tokio::time::sleep_until(t0 + ms(490)).await;
+    // After the scan at 500 ms, P gets an overdue probe.
+    tokio::time::sleep_until(t0 + ms(510)).await;
     membership.swim.mark_alive(target).await;
-    membership.swim.record_probe(target).await;
+    record_overdue_probe(&membership, target).await;
 
     tokio::time::sleep_until(t0 + ms(900)).await;
     let view_guard = Arc::clone(&membership.active).write_owned().await;
@@ -1226,24 +1251,29 @@ async fn an_on_time_ack_wins_while_a_commit_waits_for_a_view_lock() {
         let membership = Arc::clone(&membership);
         tokio::spawn(async move { membership.add_active(peer(8)).await })
     };
-    tokio::time::sleep_until(t0 + ms(940)).await;
+    settle().await;
+    assert!(
+        !committer.is_finished(),
+        "scenario: the commit waits for the view lock"
+    );
+    tokio::time::sleep_until(t0 + ms(950)).await;
     let ack = {
         let swim = Arc::clone(&membership.swim);
         tokio::spawn(async move { swim.handle_ack(target).await })
     };
-    tokio::time::sleep_until(t0 + ms(970)).await;
+    settle().await;
     let ack_done_while_the_view_was_held = ack.is_finished();
-    tokio::time::sleep_until(t0 + ms(1100)).await;
+    // The scan at 1000 ms runs while the view lock is still held.
+    tokio::time::sleep_until(t0 + ms(1001)).await;
     drop(view_guard);
     committer.await.unwrap().unwrap();
     ack.await.unwrap().unwrap();
-    // A queued timeout write runs now.
-    tokio::time::sleep(ms(50)).await;
+    settle().await;
 
     assert_eq!(
         swim_state(&membership, target),
         Some(PeerState::Alive),
-        "the on-time ACK must win over the probe timeout"
+        "the ACK before the scan must win over the probe timeout"
     );
     assert!(
         ack_done_while_the_view_was_held,
@@ -1252,36 +1282,41 @@ async fn an_on_time_ack_wins_while_a_commit_waits_for_a_view_lock() {
     assert!(membership.active_view().contains(&peer(8)));
 }
 
-/// The probe-timeout re-check (Codex re-review of 43af9eb): an ACK that
-/// arrives after the timeout scan and before the timeout's state write
-/// wins, and the timeout does not act on the answered probe. The probe to
-/// P is sent at 490 ms; the scan at 1000 ms finds it late. Another holder
-/// keeps the SWIM state lock from 950 ms to 1050 ms, so the timeout's
-/// write waits. P's ACK arrives at 1020 ms. At 43af9eb the timeout then
-/// marked P suspect and asked W for an indirect probe of P.
-#[tokio::test]
-async fn an_ack_after_the_timeout_scan_and_before_its_state_write_wins() {
+/// The probe-timeout re-check (Codex re-review of 43af9eb), deterministic:
+/// an ACK that completes between the timeout scan and the timeout's
+/// re-check wins, and the timeout does not act on the answered probe. P has
+/// an overdue probe. A holder keeps the probe table from 990 ms to 1001 ms,
+/// so the scan at 1000 ms waits for it, and P's ACK then queues for the
+/// table behind the scan. When the holder lets go, the scan finds P overdue
+/// and the ACK clears P's probe before the timeout re-checks it. At
+/// 43af9eb the timeout marked P suspect and asked W for an indirect probe
+/// of P.
+#[tokio::test(start_paused = true)]
+async fn an_ack_between_the_timeout_scan_and_its_recheck_wins() {
     let (membership, transport) = membership(Script::default());
     let t0 = background_tasks_started().await;
     let target = peer(7);
     let witness = peer(9);
     membership.swim.mark_alive(witness).await;
 
-    tokio::time::sleep_until(t0 + ms(490)).await;
+    tokio::time::sleep_until(t0 + ms(510)).await;
     membership.swim.mark_alive(target).await;
-    membership.swim.record_probe(target).await;
+    record_overdue_probe(&membership, target).await;
 
-    tokio::time::sleep_until(t0 + ms(950)).await;
-    let state_guard = Arc::clone(&membership.swim.states).write_owned().await;
-    tokio::time::sleep_until(t0 + ms(1020)).await;
+    tokio::time::sleep_until(t0 + ms(990)).await;
+    let table_guard = Arc::clone(&membership.swim.pending_probes)
+        .write_owned()
+        .await;
+    // The scan at 1000 ms waits for the table.
+    tokio::time::sleep_until(t0 + ms(1001)).await;
     let ack = {
         let swim = Arc::clone(&membership.swim);
         tokio::spawn(async move { swim.handle_ack(target).await })
     };
-    tokio::time::sleep_until(t0 + ms(1050)).await;
-    drop(state_guard);
+    settle().await;
+    drop(table_guard);
     ack.await.unwrap().unwrap();
-    tokio::time::sleep(ms(50)).await;
+    settle().await;
 
     assert_eq!(
         transport.ping_reqs_about(target),
@@ -1289,6 +1324,51 @@ async fn an_ack_after_the_timeout_scan_and_before_its_state_write_wins() {
         "the timeout acted on a probe that the ACK had answered"
     );
     assert_eq!(swim_state(&membership, target), Some(PeerState::Alive));
+}
+
+/// Codex re-review of 104fde5, finding 1: repeated probe-table contention
+/// must not suppress a valid suspicion. P has an overdue probe that no ACK
+/// answers. At each scan another task holds the SWIM state lock, so the
+/// timeout waits for it after the scan; while the timeout waits, a writer
+/// takes the probe table if it can, and only then is the state lock freed.
+/// The bound: the first scan that finds the overdue probe suspects it. At
+/// 104fde5 the timeout's `try_read` of the table failed on every such scan,
+/// and P stayed Alive.
+#[tokio::test(start_paused = true)]
+async fn a_busy_probe_table_does_not_delay_the_suspicion_of_an_overdue_probe() {
+    let (membership, _transport) = membership(Script::default());
+    let t0 = background_tasks_started().await;
+    let target = peer(7);
+
+    tokio::time::sleep_until(t0 + ms(510)).await;
+    membership.swim.mark_alive(target).await;
+    record_overdue_probe(&membership, target).await;
+
+    let mut suspected_on = None;
+    for scan in 1..=4_u64 {
+        let tick = t0 + ms(500 + 500 * scan);
+        tokio::time::sleep_until(tick - ms(10)).await;
+        let state_guard = Arc::clone(&membership.swim.states).write_owned().await;
+        // The scan at `tick` finds the overdue probe and waits for the state.
+        tokio::time::sleep_until(tick + ms(1)).await;
+        let table_guard = Arc::clone(&membership.swim.pending_probes)
+            .try_write_owned()
+            .ok();
+        drop(state_guard);
+        settle().await;
+        drop(table_guard);
+        settle().await;
+        if swim_state(&membership, target) == Some(PeerState::Suspect) {
+            suspected_on = Some(scan);
+            break;
+        }
+    }
+
+    assert_eq!(
+        suspected_on,
+        Some(1),
+        "the first scan that finds the overdue probe must suspect it"
+    );
 }
 
 /// With the commit taking its locks without waiting while it holds
