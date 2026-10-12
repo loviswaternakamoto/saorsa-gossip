@@ -1,9 +1,9 @@
 # ADR-015: Step-by-Step JOIN API with a Caller-Held Retry Ledger
 
-- **Status:** Proposed
+- **Status:** Accepted (David, x0x ruling D256, 2026-10-12)
 - **Date:** 2026-10-12
 - **Decision owners:** David Irvine
-- **Reviewers:** <pending>
+- **Reviewers:** Codex (gpt-6-astra), cross-family, rounds 1–11 of x0x #1321
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** [x0x #1321](https://github.com/saorsa-labs/x0x/issues/1321); x0x rulings D248 (the JOIN driver stays in saorsa-gossip) and D252 (exponential loss backoff, owned by saorsa-gossip); [ADR-001](ADR-001-protocol-layering.md)
