@@ -61,6 +61,8 @@ struct Recorded {
     join_send_calls: usize,
     /// The target of each JOIN send call.
     join_send_targets: Vec<PeerId>,
+    /// SWIM indirect-probe requests: (asked peer, suspect target).
+    ping_reqs: Vec<(PeerId, PeerId)>,
 }
 
 /// A [`GossipTransport`] with scripted dials and JOIN sends. It records
@@ -107,6 +109,17 @@ impl ScriptedTransport {
 
     fn join_send_calls(&self) -> usize {
         self.recorded.lock().unwrap().join_send_calls
+    }
+
+    /// Indirect-probe requests that name `target` as the suspect.
+    fn ping_reqs_about(&self, target: PeerId) -> usize {
+        self.recorded
+            .lock()
+            .unwrap()
+            .ping_reqs
+            .iter()
+            .filter(|(_, suspect)| *suspect == target)
+            .count()
     }
 }
 
@@ -160,6 +173,11 @@ impl GossipTransport for ScriptedTransport {
         stream_type: GossipStreamType,
         data: Bytes,
     ) -> Result<()> {
+        if let Ok(MembershipProtocolMessage::Swim(SwimMessage::PingReq { target, .. })) =
+            postcard::from_bytes::<MembershipProtocolMessage>(&data)
+        {
+            self.recorded.lock().unwrap().ping_reqs.push((peer, target));
+        }
         if !is_join_frame(&data) {
             return Ok(());
         }
@@ -1167,6 +1185,144 @@ async fn the_active_view_stays_readable_while_a_commit_waits_for_the_swim_lock()
         sorted(vec![peer(1), peer(2)])
     );
     assert_eq!(swim_state(&membership, peer(2)), Some(PeerState::Alive));
+}
+
+/// Let the membership's background tasks start (in a current-thread
+/// runtime they run at this yield), and return the time origin of their
+/// intervals: the SWIM probe-timeout scans run at about this time plus
+/// k x 500 ms, and the first SWIM probe round at this time plus 1 s.
+async fn background_tasks_started() -> TokioInstant {
+    tokio::task::yield_now().await;
+    TokioInstant::now()
+}
+
+fn ms(millis: u64) -> Duration {
+    Duration::from_millis(millis)
+}
+
+/// Codex re-review of 43af9eb, finding 1 (real time): SWIM progress must
+/// not wait for view-lock contention. The probe to P is sent at 490 ms, so
+/// its deadline is 990 ms and the scan at 1000 ms finds it late. A view
+/// holder keeps the active-view lock from 900 ms to 1100 ms, across that
+/// scan, and `add_active(Q)` waits for the lock. P's ACK arrives at 940 ms,
+/// before the deadline. The ACK must complete at once and P must stay
+/// alive. At 43af9eb the commit held the SWIM state lock while it waited:
+/// the ACK queued behind it, and the queued timeout write then overwrote
+/// Alive with Suspect.
+#[tokio::test]
+async fn an_on_time_ack_wins_while_a_commit_waits_for_a_view_lock() {
+    let (membership, _transport) = membership(Script::default());
+    let membership = Arc::new(membership);
+    let t0 = background_tasks_started().await;
+    let target = peer(7);
+
+    tokio::time::sleep_until(t0 + ms(490)).await;
+    membership.swim.mark_alive(target).await;
+    membership.swim.record_probe(target).await;
+
+    tokio::time::sleep_until(t0 + ms(900)).await;
+    let view_guard = Arc::clone(&membership.active).write_owned().await;
+    let committer = {
+        let membership = Arc::clone(&membership);
+        tokio::spawn(async move { membership.add_active(peer(8)).await })
+    };
+    tokio::time::sleep_until(t0 + ms(940)).await;
+    let ack = {
+        let swim = Arc::clone(&membership.swim);
+        tokio::spawn(async move { swim.handle_ack(target).await })
+    };
+    tokio::time::sleep_until(t0 + ms(970)).await;
+    let ack_done_while_the_view_was_held = ack.is_finished();
+    tokio::time::sleep_until(t0 + ms(1100)).await;
+    drop(view_guard);
+    committer.await.unwrap().unwrap();
+    ack.await.unwrap().unwrap();
+    // A queued timeout write runs now.
+    tokio::time::sleep(ms(50)).await;
+
+    assert_eq!(
+        swim_state(&membership, target),
+        Some(PeerState::Alive),
+        "the on-time ACK must win over the probe timeout"
+    );
+    assert!(
+        ack_done_while_the_view_was_held,
+        "the ACK must not wait for the view-lock contention"
+    );
+    assert!(membership.active_view().contains(&peer(8)));
+}
+
+/// The probe-timeout re-check (Codex re-review of 43af9eb): an ACK that
+/// arrives after the timeout scan and before the timeout's state write
+/// wins, and the timeout does not act on the answered probe. The probe to
+/// P is sent at 490 ms; the scan at 1000 ms finds it late. Another holder
+/// keeps the SWIM state lock from 950 ms to 1050 ms, so the timeout's
+/// write waits. P's ACK arrives at 1020 ms. At 43af9eb the timeout then
+/// marked P suspect and asked W for an indirect probe of P.
+#[tokio::test]
+async fn an_ack_after_the_timeout_scan_and_before_its_state_write_wins() {
+    let (membership, transport) = membership(Script::default());
+    let t0 = background_tasks_started().await;
+    let target = peer(7);
+    let witness = peer(9);
+    membership.swim.mark_alive(witness).await;
+
+    tokio::time::sleep_until(t0 + ms(490)).await;
+    membership.swim.mark_alive(target).await;
+    membership.swim.record_probe(target).await;
+
+    tokio::time::sleep_until(t0 + ms(950)).await;
+    let state_guard = Arc::clone(&membership.swim.states).write_owned().await;
+    tokio::time::sleep_until(t0 + ms(1020)).await;
+    let ack = {
+        let swim = Arc::clone(&membership.swim);
+        tokio::spawn(async move { swim.handle_ack(target).await })
+    };
+    tokio::time::sleep_until(t0 + ms(1050)).await;
+    drop(state_guard);
+    ack.await.unwrap().unwrap();
+    tokio::time::sleep(ms(50)).await;
+
+    assert_eq!(
+        transport.ping_reqs_about(target),
+        0,
+        "the timeout acted on a probe that the ACK had answered"
+    );
+    assert_eq!(swim_state(&membership, target), Some(PeerState::Alive));
+}
+
+/// With the commit taking its locks without waiting while it holds
+/// another, a demoting commit that waits for the passive-view lock holds
+/// no active-view lock, so `active_view()` keeps returning the full view.
+/// (0.5.87 and 43af9eb held the active lock during this wait, and
+/// `active_view()` returned an empty list.)
+#[tokio::test(start_paused = true)]
+async fn the_active_view_stays_readable_while_a_demoting_commit_waits_for_the_passive_lock() {
+    let (membership, _transport) = membership(Script::default());
+    let before: Vec<PeerId> = (1..=DEFAULT_ACTIVE_DEGREE as u8).map(peer).collect();
+    for existing in &before {
+        membership.add_active(*existing).await.unwrap();
+    }
+    let membership = Arc::new(membership);
+    let passive_guard = Arc::clone(&membership.passive).write_owned().await;
+    let adder = {
+        let membership = Arc::clone(&membership);
+        tokio::spawn(async move { membership.add_active(peer(99)).await })
+    };
+    tokio::time::sleep(ms(10)).await;
+    assert!(
+        !adder.is_finished(),
+        "scenario: the demoting commit waits for the passive lock"
+    );
+
+    assert_eq!(sorted(membership.active_view()), sorted(before.clone()));
+
+    drop(passive_guard);
+    adder.await.unwrap().unwrap();
+    let active = membership.active_view();
+    assert_eq!(active.len(), DEFAULT_ACTIVE_DEGREE);
+    assert!(active.contains(&peer(99)));
+    assert_eq!(membership.passive_view().len(), 1);
 }
 
 /// The time from now until `at`, in milliseconds.
