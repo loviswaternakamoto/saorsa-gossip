@@ -81,6 +81,104 @@ pub const SHUFFLE_ACTIVE_SIZE: usize = 3;
 /// Number of peers to include in shuffle from passive view
 pub const SHUFFLE_PASSIVE_SIZE: usize = 4;
 
+/// Most JOIN attempts per seed address. One attempt is one
+/// [`GossipTransport::dial_bootstrap`].
+pub const JOIN_MAX_ATTEMPTS: usize = 10;
+/// Backoff after the first failed JOIN dial to a seed, in milliseconds.
+pub const JOIN_INITIAL_DELAY_MS: u64 = 100;
+/// Largest JOIN backoff, in milliseconds. The backoff doubles after each
+/// failed dial up to this value.
+pub const JOIN_MAX_DELAY_MS: u64 = 30_000;
+
+/// The JOIN retry state of each seed address: the attempts used and the
+/// current backoff delay.
+///
+/// [`Membership::join`] uses one fresh state for each entry of its seed
+/// list. A caller that drives the JOIN step by step
+/// ([`HyParViewMembership::join_dial`], [`HyParViewMembership::join_send`])
+/// keeps one ledger for its whole join. Then a seed keeps its attempts and
+/// its backoff when the caller turns to another seed and back, and a seed
+/// that has used its attempts stays exhausted.
+#[derive(Debug, Clone, Default)]
+pub struct JoinLedger {
+    seeds: HashMap<std::net::SocketAddr, JoinSeedState>,
+}
+
+/// The JOIN retry state of one seed address.
+#[derive(Debug, Clone, Copy)]
+struct JoinSeedState {
+    attempts: usize,
+    delay_ms: u64,
+}
+
+impl Default for JoinSeedState {
+    fn default() -> Self {
+        Self {
+            attempts: 0,
+            delay_ms: JOIN_INITIAL_DELAY_MS,
+        }
+    }
+}
+
+impl JoinLedger {
+    /// An empty ledger: every seed has all its attempts.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// JOIN attempts already made on `seed`.
+    #[must_use]
+    pub fn attempts(&self, seed: std::net::SocketAddr) -> usize {
+        self.seeds.get(&seed).map_or(0, |state| state.attempts)
+    }
+
+    /// `true` when `seed` has used all [`JOIN_MAX_ATTEMPTS`] attempts.
+    #[must_use]
+    pub fn is_exhausted(&self, seed: std::net::SocketAddr) -> bool {
+        self.attempts(seed) >= JOIN_MAX_ATTEMPTS
+    }
+
+    /// The backoff that the next failed dial to `seed` waits, before
+    /// jitter, in milliseconds.
+    #[must_use]
+    pub fn delay_ms(&self, seed: std::net::SocketAddr) -> u64 {
+        self.seeds
+            .get(&seed)
+            .map_or(JOIN_INITIAL_DELAY_MS, |state| state.delay_ms)
+    }
+}
+
+/// The result of one JOIN dial ([`HyParViewMembership::join_dial`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinDial {
+    /// The seed answered as this peer. The attempt continues with
+    /// [`HyParViewMembership::join_send`]. The caller may instead end the
+    /// attempt here without a JOIN frame; the attempt still counts, and the
+    /// backoff does not change.
+    Answered(PeerId),
+    /// The dial failed. Wait `retry_after` (the backoff plus jitter) before
+    /// the next attempt on this seed. Only a failed dial grows the backoff.
+    Failed {
+        /// The time to wait before the next attempt on this seed.
+        retry_after: Duration,
+        /// `true` when this was the seed's last attempt.
+        exhausted: bool,
+    },
+    /// The seed has used all its attempts. No dial was made.
+    Exhausted,
+}
+
+/// The result of a JOIN send ([`HyParViewMembership::join_send`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinSend {
+    /// The JOIN frame was sent and the seed is in the active view.
+    Joined,
+    /// The JOIN frame could not be sent. The next attempt on this seed may
+    /// start at once; the backoff does not change.
+    SendFailed,
+}
+
 /// HyParView neighbor priority
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NeighborPriority {
@@ -1077,6 +1175,119 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
             .await
     }
 
+    /// The first step of one JOIN attempt on `seed`: the dial.
+    ///
+    /// This is the attempt of [`Membership::join`], split so that a caller
+    /// can decide between the dial and the JOIN frame (for example, check
+    /// the answered peer's admission). `ledger` holds the seed's attempts
+    /// and backoff; keep one ledger for the whole join.
+    ///
+    /// - [`JoinDial::Exhausted`]: the seed has used [`JOIN_MAX_ATTEMPTS`]
+    ///   attempts; no dial is made.
+    /// - [`JoinDial::Answered`]: continue with [`Self::join_send`], or end
+    ///   the attempt without a JOIN frame.
+    /// - [`JoinDial::Failed`]: wait `retry_after` before the next attempt
+    ///   on this seed. The backoff doubles (at most [`JOIN_MAX_DELAY_MS`]).
+    ///
+    /// Cancel safety: the future can be dropped. The attempt then counts,
+    /// and the backoff does not change.
+    pub async fn join_dial(&self, ledger: &mut JoinLedger, seed: std::net::SocketAddr) -> JoinDial {
+        self.join_dial_labelled(ledger, seed, &seed).await
+    }
+
+    /// The second step of one JOIN attempt: store the seed's address, send
+    /// the JOIN frame to `peer` (the peer that answered the dial to `seed`),
+    /// and add it to the active view, as [`Membership::join`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of adding the seed to the active view.
+    /// [`Membership::join`] ends the JOIN with this error.
+    ///
+    /// Cancel safety: the future can be dropped. Before the send completes,
+    /// only the stored address remains. After the send, the seed may have
+    /// the JOIN even though the active view was not updated.
+    pub async fn join_send(&self, seed: std::net::SocketAddr, peer: PeerId) -> Result<JoinSend> {
+        self.join_send_labelled(seed, peer, &seed).await
+    }
+
+    /// [`Self::join_dial`], with `label` as the `seed` field of its logs.
+    async fn join_dial_labelled(
+        &self,
+        ledger: &mut JoinLedger,
+        addr: std::net::SocketAddr,
+        label: &(dyn std::fmt::Display + Sync),
+    ) -> JoinDial {
+        let state = ledger.seeds.entry(addr).or_default();
+        if state.attempts >= JOIN_MAX_ATTEMPTS {
+            return JoinDial::Exhausted;
+        }
+        let attempt = state.attempts;
+        state.attempts += 1;
+        debug!(
+            seed = %label,
+            attempt = attempt + 1,
+            "JOIN: Connecting to bootstrap node"
+        );
+
+        // Connect via transport and get peer ID
+        match self.transport.dial_bootstrap(addr).await {
+            Ok(seed_peer_id) => {
+                debug!(
+                    seed = %label,
+                    peer_id = %seed_peer_id,
+                    "JOIN: Connected to bootstrap"
+                );
+                JoinDial::Answered(seed_peer_id)
+            }
+            Err(e) => {
+                let delay_ms = state.delay_ms;
+                warn!(
+                    seed = %label,
+                    attempt = attempt + 1,
+                    error = %e,
+                    delay_ms = delay_ms,
+                    "JOIN: Connection failed, will retry"
+                );
+
+                // Exponential backoff with jitter
+                let jitter = (rand::random::<u64>() % (delay_ms / 4)).saturating_sub(delay_ms / 8);
+                state.delay_ms = (delay_ms * 2).min(JOIN_MAX_DELAY_MS);
+                JoinDial::Failed {
+                    retry_after: Duration::from_millis(delay_ms + jitter),
+                    exhausted: state.attempts >= JOIN_MAX_ATTEMPTS,
+                }
+            }
+        }
+    }
+
+    /// [`Self::join_send`], with `label` as the `seed` field of its logs.
+    async fn join_send_labelled(
+        &self,
+        addr: std::net::SocketAddr,
+        seed_peer_id: PeerId,
+        label: &(dyn std::fmt::Display + Sync),
+    ) -> Result<JoinSend> {
+        // Store peer address
+        self.store_peer_addr(seed_peer_id, addr).await;
+
+        // Send JOIN message
+        let join_msg = HyParViewMessage::Join {
+            sender: self.local_peer_id,
+            ttl: ACTIVE_RANDOM_WALK_LENGTH,
+        };
+
+        if let Err(e) = self.send_hyparview_message(seed_peer_id, &join_msg).await {
+            warn!(error = %e, "JOIN: Failed to send JOIN message");
+            return Ok(JoinSend::SendFailed);
+        }
+
+        // Add seed to active view immediately (optimistic)
+        self.add_active(seed_peer_id).await?;
+        debug!(seed = %label, "JOIN: Successfully joined network");
+        Ok(JoinSend::Joined)
+    }
+
     /// Get the SWIM detector
     pub fn swim(&self) -> &SwimDetector<T> {
         &self.swim
@@ -1635,11 +1846,6 @@ impl<T: GossipTransport + 'static> Membership for HyParViewMembership<T> {
             return Ok(());
         }
 
-        // Exponential backoff parameters
-        const INITIAL_DELAY_MS: u64 = 100;
-        const MAX_DELAY_MS: u64 = 30_000;
-        const MAX_RETRIES: usize = 10;
-
         for seed in seeds {
             // Parse the seed address
             let addr: SocketAddr = match seed.parse() {
@@ -1650,66 +1856,23 @@ impl<T: GossipTransport + 'static> Membership for HyParViewMembership<T> {
                 }
             };
 
-            let mut delay_ms = INITIAL_DELAY_MS;
-            let mut connected = false;
-
-            for attempt in 0..MAX_RETRIES {
-                debug!(
-                    seed = %seed,
-                    attempt = attempt + 1,
-                    "JOIN: Connecting to bootstrap node"
-                );
-
-                // Connect via transport and get peer ID
-                match self.transport.dial_bootstrap(addr).await {
-                    Ok(seed_peer_id) => {
-                        debug!(
-                            seed = %seed,
-                            peer_id = %seed_peer_id,
-                            "JOIN: Connected to bootstrap"
-                        );
-
-                        // Store peer address
-                        self.store_peer_addr(seed_peer_id, addr).await;
-
-                        // Send JOIN message
-                        let join_msg = HyParViewMessage::Join {
-                            sender: self.local_peer_id,
-                            ttl: ACTIVE_RANDOM_WALK_LENGTH,
-                        };
-
-                        if let Err(e) = self.send_hyparview_message(seed_peer_id, &join_msg).await {
-                            warn!(error = %e, "JOIN: Failed to send JOIN message");
-                            continue;
+            // A fresh retry state for each seed-list entry: up to
+            // JOIN_MAX_ATTEMPTS dials, backoff only after a failed dial.
+            let mut ledger = JoinLedger::new();
+            loop {
+                match self.join_dial_labelled(&mut ledger, addr, &seed).await {
+                    JoinDial::Answered(seed_peer_id) => {
+                        match self.join_send_labelled(addr, seed_peer_id, &seed).await? {
+                            // Successfully joined via this seed
+                            JoinSend::Joined => return Ok(()),
+                            JoinSend::SendFailed => {}
                         }
-
-                        // Add seed to active view immediately (optimistic)
-                        self.add_active(seed_peer_id).await?;
-                        connected = true;
-                        break;
                     }
-                    Err(e) => {
-                        warn!(
-                            seed = %seed,
-                            attempt = attempt + 1,
-                            error = %e,
-                            delay_ms = delay_ms,
-                            "JOIN: Connection failed, will retry"
-                        );
-
-                        // Exponential backoff with jitter
-                        let jitter =
-                            (rand::random::<u64>() % (delay_ms / 4)).saturating_sub(delay_ms / 8);
-                        tokio::time::sleep(Duration::from_millis(delay_ms + jitter)).await;
-                        delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+                    JoinDial::Failed { retry_after, .. } => {
+                        tokio::time::sleep(retry_after).await;
                     }
+                    JoinDial::Exhausted => break,
                 }
-            }
-
-            if connected {
-                // Successfully joined via this seed
-                debug!(seed = %seed, "JOIN: Successfully joined network");
-                return Ok(());
             }
         }
 
@@ -1789,6 +1952,9 @@ impl<T: GossipTransport + 'static> Membership for HyParViewMembership<T> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod join_budget_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
