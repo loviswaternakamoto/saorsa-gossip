@@ -49,12 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **membership: an on-time SWIM ACK no longer loses to the probe timeout.**
   The probe-timeout task scans the pending probes and then takes the SWIM
   state lock. An ACK that arrived between the two still had its sender
-  marked Suspect. The task now re-checks, with the state lock held, that the
-  same probe is still pending, and `handle_ack` / `handle_ack_response` clear
-  the probe before they mark the peer alive. So an ACK is either seen by the
-  re-check or marks the peer alive after the timeout's write. The re-check
-  does not wait for the probe table while it holds the state lock; when the
-  table is busy, the next scan decides.
+  marked Suspect. For each overdue probe the task now takes the probe table
+  (read) and then the state lock, and re-checks that the same probe is still
+  pending; `handle_ack` / `handle_ack_response` clear the probe before they
+  mark the peer alive. So an ACK that cleared the probe after the scan is
+  seen by the re-check, and a later ACK marks the peer alive after the
+  timeout's write. Both waits are fair, so a busy probe table delays the
+  re-check but cannot skip it: the first scan that finds an overdue probe
+  decides it.
 
 ## [0.5.87] - 2026-10-04
 

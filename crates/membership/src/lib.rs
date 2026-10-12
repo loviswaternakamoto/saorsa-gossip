@@ -747,23 +747,19 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
                 for (peer, probe_time) in timed_out_peers {
                     // Mark as suspect
                     {
+                        // An ACK can have arrived after the scan. Take the
+                        // probe table (read), then the state lock, and check
+                        // that the same probe is still pending. An ACK clears
+                        // the probe before it marks the peer alive, so an
+                        // ACK that cleared it after the scan is seen here,
+                        // and a later ACK waits for this read and marks the
+                        // peer alive after this write. Both waits are fair,
+                        // so busy writers can delay the re-check but not skip
+                        // it. Order probe table -> state: no path holds the
+                        // state lock while it waits for the probe table.
+                        let pending = pending_probes.read().await;
                         let mut states_guard = states.write().await;
-                        // An ACK can have arrived after the scan. With the
-                        // state lock held, check that the same probe is
-                        // still pending. An ACK clears the probe before it
-                        // marks the peer alive, so it is either seen here or
-                        // marks the peer alive after this write. The check
-                        // does not wait for the probe table while it holds
-                        // the state lock: when that table is busy, the next
-                        // scan decides.
-                        let still_pending = match pending_probes.try_read() {
-                            Ok(pending) => pending.get(&peer) == Some(&probe_time),
-                            Err(_) => {
-                                trace!(peer_id = %peer, "SWIM: Probe table busy; the next scan decides");
-                                continue;
-                            }
-                        };
-                        if !still_pending {
+                        if pending.get(&peer) != Some(&probe_time) {
                             trace!(peer_id = %peer, "SWIM: Probe answered after the timeout scan");
                             continue;
                         }
@@ -1352,14 +1348,18 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
     ///   another. So view contention does not delay SWIM (an ACK or a
     ///   probe-timeout write), and SWIM contention does not hide the views:
     ///   [`Membership::active_view`] returns the committed view while the
-    ///   commit waits for the SWIM or the passive-view lock. While it waits
-    ///   for the active-view lock itself (only when another task holds it),
-    ///   Tokio's fair lock gives the waiting writer the free read permits,
-    ///   so `active_view` returns an empty list until the holders finish, as
-    ///   it does for every writer of the active view in 0.5.87. The
-    ///   exception that bounds the retries: after eight rounds in which some
-    ///   lock was busy, the commit waits for the locks in a fixed order
+    ///   commit waits for the SWIM or the passive-view lock, before the
+    ///   fallback below. While it waits for the active-view lock itself,
+    ///   Tokio's fair lock reserves the read permits for the waiting writer,
+    ///   so `active_view` returns an empty list while other tasks hold the
+    ///   lock and also after they release it, until the commit runs again.
+    ///   Every writer of the active view in 0.5.87 has the same effect.
+    /// - The fallback that bounds the retries: after eight rounds in which
+    ///   some lock was busy, the commit waits for the locks in a fixed order
     ///   (SWIM state, active view, passive view), holding the earlier ones.
+    ///   In the fallback, a demoting commit holds the active-view lock while
+    ///   it waits for the passive-view lock, and `active_view` returns an
+    ///   empty list for that whole wait.
     /// - A dropped future returns no result.
     ///
     /// # Runtime
@@ -1385,8 +1385,9 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
     /// view contention does not delay SWIM (an ACK, a probe-timeout write)
     /// and SWIM contention does not hide the views from `try_read` readers
     /// such as `active_view()`. (A wait for the active-view lock itself
-    /// blocks new readers of that lock, as for every writer: Tokio's lock
-    /// is fair.) Each round takes the locks with `try_write`.
+    /// blocks new readers of that lock until the commit runs again, as for
+    /// every writer: Tokio's lock is fair and reserves the permits for the
+    /// waiting writer.) Each round takes the locks with `try_write`.
     /// When one is busy, the round releases what it holds, then waits for
     /// that one lock alone (in the lock's fair queue) and starts the next
     /// round holding it. There is no busy wait: a round repeats only after
