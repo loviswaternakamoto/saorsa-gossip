@@ -81,6 +81,177 @@ pub const SHUFFLE_ACTIVE_SIZE: usize = 3;
 /// Number of peers to include in shuffle from passive view
 pub const SHUFFLE_PASSIVE_SIZE: usize = 4;
 
+/// Most JOIN attempts per seed address. One attempt is one
+/// [`GossipTransport::dial_bootstrap`].
+pub const JOIN_MAX_ATTEMPTS: usize = 10;
+/// Backoff after the first failed JOIN dial to a seed, in milliseconds.
+pub const JOIN_INITIAL_DELAY_MS: u64 = 100;
+/// Largest JOIN backoff, in milliseconds. The backoff doubles after each
+/// failed dial up to this value.
+pub const JOIN_MAX_DELAY_MS: u64 = 30_000;
+
+/// The JOIN retry state of each seed address: the attempts used and the
+/// current backoff delay.
+///
+/// [`Membership::join`] uses one fresh state for each entry of its seed
+/// list. A caller that drives the JOIN step by step
+/// ([`HyParViewMembership::join_dial`], [`HyParViewMembership::join_send`])
+/// keeps one ledger for its whole join. Then a seed keeps its attempts, its
+/// backoff and its loss cooldown when the caller turns to another seed and
+/// back, and a seed that has used its attempts stays exhausted.
+///
+/// A seed has two independent delays:
+/// - the dial backoff, which grows only after a failed dial (as in
+///   [`Membership::join`]);
+/// - the loss cooldown ([`Self::record_loss`]), which grows each time the
+///   caller reports that the peer which answered the dial lost its
+///   connection before the JOIN frame could go out. Answered dials do not
+///   reset it.
+///
+/// [`Self::ready_at`] is the later of the two readiness times; the delays
+/// are not added. [`HyParViewMembership::join_dial`] makes no dial before
+/// it.
+#[derive(Debug, Clone, Default)]
+pub struct JoinLedger {
+    seeds: HashMap<std::net::SocketAddr, JoinSeedState>,
+}
+
+/// The JOIN retry state of one seed address.
+#[derive(Debug, Clone, Copy)]
+struct JoinSeedState {
+    attempts: usize,
+    delay_ms: u64,
+    loss_delay_ms: u64,
+    ready_at: Option<tokio::time::Instant>,
+}
+
+impl Default for JoinSeedState {
+    fn default() -> Self {
+        Self {
+            attempts: 0,
+            delay_ms: JOIN_INITIAL_DELAY_MS,
+            loss_delay_ms: JOIN_INITIAL_DELAY_MS,
+            ready_at: None,
+        }
+    }
+}
+
+/// The JOIN jitter for a delay of `delay_ms` (at least
+/// [`JOIN_INITIAL_DELAY_MS`]): a random value below `delay_ms / 4`, minus
+/// `delay_ms / 8`, at least zero.
+fn join_jitter_ms(delay_ms: u64) -> u64 {
+    (rand::random::<u64>() % (delay_ms / 4)).saturating_sub(delay_ms / 8)
+}
+
+impl JoinLedger {
+    /// An empty ledger: every seed has all its attempts.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// JOIN attempts already made on `seed`.
+    #[must_use]
+    pub fn attempts(&self, seed: std::net::SocketAddr) -> usize {
+        self.seeds.get(&seed).map_or(0, |state| state.attempts)
+    }
+
+    /// `true` when `seed` has used all [`JOIN_MAX_ATTEMPTS`] attempts.
+    #[must_use]
+    pub fn is_exhausted(&self, seed: std::net::SocketAddr) -> bool {
+        self.attempts(seed) >= JOIN_MAX_ATTEMPTS
+    }
+
+    /// The backoff that the next failed dial to `seed` waits, before
+    /// jitter, in milliseconds.
+    #[must_use]
+    pub fn delay_ms(&self, seed: std::net::SocketAddr) -> u64 {
+        self.seeds
+            .get(&seed)
+            .map_or(JOIN_INITIAL_DELAY_MS, |state| state.delay_ms)
+    }
+
+    /// The cooldown that the next [`Self::record_loss`] on `seed` starts,
+    /// before jitter, in milliseconds.
+    #[must_use]
+    pub fn loss_delay_ms(&self, seed: std::net::SocketAddr) -> u64 {
+        self.seeds
+            .get(&seed)
+            .map_or(JOIN_INITIAL_DELAY_MS, |state| state.loss_delay_ms)
+    }
+
+    /// The earliest time for the next attempt on `seed`: the later of the
+    /// dial backoff and the loss cooldown. `None`: at once.
+    #[must_use]
+    pub fn ready_at(&self, seed: std::net::SocketAddr) -> Option<tokio::time::Instant> {
+        self.seeds.get(&seed).and_then(|state| state.ready_at)
+    }
+
+    /// Record that the peer which answered the last dial to `seed` lost its
+    /// connection before the JOIN frame could go out (for example, the
+    /// remote closed it at once). This starts the seed's loss cooldown:
+    /// [`JOIN_INITIAL_DELAY_MS`], doubled after each loss up to
+    /// [`JOIN_MAX_DELAY_MS`], plus the JOIN jitter. Answered dials do not
+    /// reset it, and it does not change the dial backoff or the attempts.
+    ///
+    /// Returns the new [`Self::ready_at`] of `seed`: the later of its
+    /// current readiness and the end of the cooldown.
+    pub fn record_loss(&mut self, seed: std::net::SocketAddr) -> tokio::time::Instant {
+        let state = self.seeds.entry(seed).or_default();
+        let delay_ms = state.loss_delay_ms;
+        let cooldown = Duration::from_millis(delay_ms + join_jitter_ms(delay_ms));
+        state.loss_delay_ms = (delay_ms * 2).min(JOIN_MAX_DELAY_MS);
+        let loss_ready = tokio::time::Instant::now() + cooldown;
+        let ready = state
+            .ready_at
+            .map_or(loss_ready, |current| current.max(loss_ready));
+        state.ready_at = Some(ready);
+        debug!(
+            seed = %seed,
+            delay_ms = delay_ms,
+            "JOIN: Seed lost its connection after the dial, cooling down"
+        );
+        ready
+    }
+}
+
+/// The result of one JOIN dial ([`HyParViewMembership::join_dial`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinDial {
+    /// The seed answered as this peer. The attempt continues with
+    /// [`HyParViewMembership::join_send`]. The caller may instead end the
+    /// attempt here without a JOIN frame; the attempt still counts, and the
+    /// backoff does not change.
+    Answered(PeerId),
+    /// The dial failed. Wait `retry_after` (the backoff plus jitter) before
+    /// the next attempt on this seed. Only a failed dial grows the backoff.
+    Failed {
+        /// The time to wait before the next attempt on this seed.
+        retry_after: Duration,
+        /// `true` when this was the seed's last attempt.
+        exhausted: bool,
+    },
+    /// The seed has used all its attempts. No dial was made.
+    Exhausted,
+    /// The seed's dial backoff or loss cooldown has not ended
+    /// ([`JoinLedger::ready_at`]). No dial was made and no attempt was
+    /// used. Try again at `ready_at`, or try another seed meanwhile.
+    NotReady {
+        /// The earliest time for the next attempt on this seed.
+        ready_at: tokio::time::Instant,
+    },
+}
+
+/// The result of a JOIN send ([`HyParViewMembership::join_send`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinSend {
+    /// The JOIN frame was sent and the seed is in the active view.
+    Joined,
+    /// The JOIN frame could not be sent. The next attempt on this seed may
+    /// start at once; the backoff does not change.
+    SendFailed,
+}
+
 /// HyParView neighbor priority
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NeighborPriority {
@@ -243,6 +414,11 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
     /// Mark a peer as alive
     pub async fn mark_alive(&self, peer: PeerId) {
         let mut states = self.states.write().await;
+        Self::set_alive(&mut states, peer);
+    }
+
+    /// Mark `peer` alive in a state table that the caller has locked.
+    fn set_alive(states: &mut HashMap<PeerId, SwimPeerEntry>, peer: PeerId) {
         states.insert(
             peer,
             SwimPeerEntry {
@@ -363,11 +539,12 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
     ///
     /// Marks the sender as alive and clears any pending probe for this peer.
     pub async fn handle_ack(&self, sender: PeerId) -> Result<()> {
-        // Mark sender as alive - they responded to our ping
-        self.mark_alive(sender).await;
-
-        // Clear pending probe if one exists
+        // Clear the pending probe first, then mark the sender alive (it
+        // responded to our ping). The probe-timeout task re-checks the probe
+        // while it holds the state lock, so this ACK is either seen by that
+        // re-check or marks the sender alive after the timeout's write.
         let was_pending = self.clear_probe(&sender).await;
+        self.mark_alive(sender).await;
         let indirect_requesters = self.take_indirect_probe_requesters(sender).await;
 
         if was_pending {
@@ -527,11 +704,10 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
             "SWIM: Received AckResponse, marking target as alive"
         );
 
-        // Mark target as alive (overrides suspect)
-        self.mark_alive(target).await;
-
-        // Clear any pending probe for this target
+        // Clear any pending probe for this target, then mark it alive
+        // (overrides suspect). The order is the same as in `handle_ack`.
         self.clear_probe(&target).await;
+        self.mark_alive(target).await;
 
         Ok(())
     }
@@ -562,18 +738,32 @@ impl<T: GossipTransport + 'static> SwimDetector<T> {
                     for (peer, probe_time) in pending.iter() {
                         let elapsed = now.duration_since(*probe_time);
                         if elapsed >= Duration::from_millis(SWIM_ACK_TIMEOUT_MS) {
-                            timed_out_peers.push(*peer);
+                            timed_out_peers.push((*peer, *probe_time));
                         }
                     }
                 }
 
                 // For each timed-out peer: mark as suspect and trigger indirect probes
-                for peer in timed_out_peers {
-                    debug!(peer_id = %peer, "SWIM: Probe timeout, marking suspect");
-
+                for (peer, probe_time) in timed_out_peers {
                     // Mark as suspect
                     {
+                        // An ACK can have arrived after the scan. Take the
+                        // probe table (read), then the state lock, and check
+                        // that the same probe is still pending. An ACK clears
+                        // the probe before it marks the peer alive, so an
+                        // ACK that cleared it after the scan is seen here,
+                        // and a later ACK waits for this read and marks the
+                        // peer alive after this write. Both waits are fair,
+                        // so busy writers can delay the re-check but not skip
+                        // it. Order probe table -> state: no path holds the
+                        // state lock while it waits for the probe table.
+                        let pending = pending_probes.read().await;
                         let mut states_guard = states.write().await;
+                        if pending.get(&peer) != Some(&probe_time) {
+                            trace!(peer_id = %peer, "SWIM: Probe answered after the timeout scan");
+                            continue;
+                        }
+                        debug!(peer_id = %peer, "SWIM: Probe timeout, marking suspect");
                         if let Some(entry) = states_guard.get_mut(&peer) {
                             if entry.state == PeerState::Alive {
                                 entry.state = PeerState::Suspect;
@@ -905,6 +1095,22 @@ pub struct HyParViewMembership<T: GossipTransport + 'static> {
     seen_peers: Arc<RwLock<HashMap<PeerId, Instant>>>,
     /// Transport layer for sending messages
     transport: Arc<T>,
+    /// Serializes the local commits of `add_active` / `join_send`. Only
+    /// commits take it; no reader of the views or of SWIM waits for it.
+    commit_gate: tokio::sync::Mutex<()>,
+}
+
+/// Busy rounds after which [`HyParViewMembership::commit_active`] stops
+/// trying the locks without waiting and waits for them in the fixed order.
+const COMMIT_TRY_ROUNDS: usize = 8;
+
+/// The lock that a commit round found busy
+/// ([`HyParViewMembership::commit_active`]).
+#[derive(Debug, Clone, Copy)]
+enum CommitLock {
+    Swim,
+    Active,
+    Passive,
 }
 
 impl<T: GossipTransport + 'static> HyParViewMembership<T> {
@@ -925,6 +1131,7 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
             config,
             seen_peers: Arc::new(RwLock::new(HashMap::new())),
             transport,
+            commit_gate: tokio::sync::Mutex::new(()),
         };
 
         // Start background shuffle task
@@ -1075,6 +1282,326 @@ impl<T: GossipTransport + 'static> HyParViewMembership<T> {
         self.transport
             .send_to_peer(peer, GossipStreamType::Membership, bytes.into())
             .await
+    }
+
+    /// The first step of one JOIN attempt on `seed`: the dial.
+    ///
+    /// This is the attempt of [`Membership::join`], split so that a caller
+    /// can decide between the dial and the JOIN frame (for example, check
+    /// the answered peer's admission). `ledger` holds the seed's attempts
+    /// and backoff; keep one ledger for the whole join.
+    ///
+    /// - [`JoinDial::Exhausted`]: the seed has used [`JOIN_MAX_ATTEMPTS`]
+    ///   attempts; no dial is made.
+    /// - [`JoinDial::Answered`]: continue with [`Self::join_send`], or end
+    ///   the attempt without a JOIN frame.
+    /// - [`JoinDial::Failed`]: wait `retry_after` before the next attempt
+    ///   on this seed. The backoff doubles (at most [`JOIN_MAX_DELAY_MS`]).
+    /// - [`JoinDial::NotReady`]: the seed's backoff or loss cooldown has not
+    ///   ended; no dial is made and no attempt is used.
+    ///
+    /// When the peer that answered loses its connection before the caller
+    /// sends the JOIN frame, report it with [`JoinLedger::record_loss`].
+    ///
+    /// # Cancel safety
+    ///
+    /// The future can be dropped. The attempt then counts, and the backoff
+    /// does not change.
+    ///
+    /// # Runtime
+    ///
+    /// `join_dial` spawns no task and starts no timer; it reads
+    /// `tokio::time::Instant::now`, which works outside a runtime. The
+    /// transport's dial can have its own needs. [`Membership::join`] sleeps
+    /// for its backoff after a failed dial with a Tokio timer, as in 0.5.87.
+    pub async fn join_dial(&self, ledger: &mut JoinLedger, seed: std::net::SocketAddr) -> JoinDial {
+        self.join_dial_labelled(ledger, seed, &seed).await
+    }
+
+    /// The second step of one JOIN attempt: store the seed's address, send
+    /// the JOIN frame to `peer` (the peer that answered the dial to `seed`),
+    /// and add it to the active view, as [`Membership::join`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of [`Membership::add_active`] (the current
+    /// implementation returns none). [`Membership::join`] ends the JOIN
+    /// with this error.
+    ///
+    /// # Cancel safety
+    ///
+    /// The future can be dropped at any point, and a runtime shutdown drops
+    /// it in the same way. It never leaves the active view, the passive
+    /// view or the SWIM state half updated:
+    /// - Until the transport's send returns `Ok`, the only change is the
+    ///   stored address. The transport can have sent some or all of the
+    ///   frame before a drop, so the seed can have the JOIN.
+    /// - Then the local commit (the active-view insert, a demotion to the
+    ///   passive view when the active view is full, and the SWIM alive mark)
+    ///   takes every lock that it needs before its first change: the SWIM
+    ///   state, the active view, and the passive view when a demotion is
+    ///   due. After that it does not await, so it makes all its changes in
+    ///   the same poll. A drop while it waits for a lock changes nothing:
+    ///   the seed can then have the JOIN while this node does not list the
+    ///   seed. If a lock never becomes free, the future waits.
+    /// - The commit does not hold one of these locks while it waits for
+    ///   another. So view contention does not delay SWIM (an ACK or a
+    ///   probe-timeout write), and SWIM contention does not hide the views:
+    ///   [`Membership::active_view`] returns the committed view while the
+    ///   commit waits for the SWIM or the passive-view lock, before the
+    ///   fallback below. While it waits for the active-view lock itself,
+    ///   Tokio's fair lock reserves the read permits for the waiting writer,
+    ///   so `active_view` returns an empty list while other tasks hold the
+    ///   lock and also after they release it, until the commit runs again.
+    ///   Every writer of the active view in 0.5.87 has the same effect.
+    /// - The fallback that bounds the retries: after eight rounds in which
+    ///   some lock was busy, the commit waits for the locks in a fixed order
+    ///   (SWIM state, active view, passive view), holding the earlier ones.
+    ///   In the fallback, a demoting commit holds the active-view lock while
+    ///   it waits for the passive-view lock, and `active_view` returns an
+    ///   empty list for that whole wait.
+    /// - A dropped future returns no result.
+    ///
+    /// # Runtime
+    ///
+    /// `join_send` spawns no task and starts no timer, so it runs on any
+    /// executor. The transport's send can have its own needs.
+    pub async fn join_send(&self, seed: std::net::SocketAddr, peer: PeerId) -> Result<JoinSend> {
+        self.join_send_labelled(seed, peer, &seed).await
+    }
+
+    /// The body of [`Membership::add_active`], and the local commit of
+    /// [`Self::join_send`]: add `peer` to the active view (when the view is
+    /// full, demote one peer to the passive view, as in 0.5.87) and mark
+    /// `peer` alive in SWIM.
+    ///
+    /// It takes every lock that it needs before its first change: the SWIM
+    /// state, the active view, and the passive view (only when a demotion
+    /// is due). After that it does not await. So a drop, or a runtime
+    /// shutdown, while it waits changes nothing, and no executor can stop
+    /// it between its first and its last change.
+    ///
+    /// It does not hold one of these locks while it waits for another, so
+    /// view contention does not delay SWIM (an ACK, a probe-timeout write)
+    /// and SWIM contention does not hide the views from `try_read` readers
+    /// such as `active_view()`. (A wait for the active-view lock itself
+    /// blocks new readers of that lock until the commit runs again, as for
+    /// every writer: Tokio's lock is fair and reserves the permits for the
+    /// waiting writer.) Each round takes the locks with `try_write`.
+    /// When one is busy, the round releases what it holds, then waits for
+    /// that one lock alone (in the lock's fair queue) and starts the next
+    /// round holding it. There is no busy wait: a round repeats only after
+    /// a wait in which another holder made progress.
+    ///
+    /// Livelock and starvation: commits are serialized by `commit_gate`, so
+    /// two commits never compete for these locks, and no other holder of
+    /// them retries. A round can only fail when another task takes one of
+    /// the locks in the moment after the commit got the one it waited for.
+    /// The bound: after [`COMMIT_TRY_ROUNDS`] busy rounds, the commit waits
+    /// for the locks in the fixed order (SWIM state, active view, passive
+    /// view), holding the earlier ones. That order has no cycle, so the
+    /// commit then completes once the holders ahead of it are done. Only in
+    /// that case can it hold a lock while it waits for another.
+    async fn commit_active(&self, peer: PeerId) {
+        let _gate = self.commit_gate.lock().await;
+        let mut wait_for = None;
+        let mut busy_rounds = 0;
+        loop {
+            if busy_rounds == COMMIT_TRY_ROUNDS {
+                // The bound: after this many busy rounds, wait for the locks
+                // in the fixed order, holding the earlier ones. This order
+                // has no cycle: no path holds a view lock while it waits for
+                // the SWIM lock, and active before passive is also the order
+                // of degree maintenance.
+                debug!(
+                    peer_id = %peer,
+                    rounds = busy_rounds,
+                    "Active-view commit: locks stayed busy; waiting in lock order"
+                );
+                let mut states = self.swim.states.write().await;
+                let mut active = self.active.write().await;
+                let to_demote = self.demotion(&active);
+                let mut passive = match to_demote {
+                    Some(_) => Some(self.passive.write().await),
+                    None => None,
+                };
+                // Every lock is held. No await from here to the end.
+                self.apply_commit(
+                    &mut states,
+                    &mut active,
+                    passive.as_deref_mut(),
+                    to_demote,
+                    peer,
+                );
+                return;
+            }
+            // Wait for the lock that was busy, holding no other lock.
+            let mut states = None;
+            let mut active = None;
+            let mut passive = None;
+            match wait_for.take() {
+                Some(CommitLock::Swim) => states = Some(self.swim.states.write().await),
+                Some(CommitLock::Active) => active = Some(self.active.write().await),
+                Some(CommitLock::Passive) => passive = Some(self.passive.write().await),
+                None => {}
+            }
+            // Take the others without waiting. A busy lock ends the round:
+            // everything held is released at `continue`.
+            let Some(mut states) = states.or_else(|| self.swim.states.try_write().ok()) else {
+                busy_rounds += 1;
+                wait_for = Some(CommitLock::Swim);
+                continue;
+            };
+            let Some(mut active) = active.or_else(|| self.active.try_write().ok()) else {
+                busy_rounds += 1;
+                wait_for = Some(CommitLock::Active);
+                continue;
+            };
+            let to_demote = self.demotion(&active);
+            let mut passive = match to_demote {
+                Some(_) => match passive.or_else(|| self.passive.try_write().ok()) {
+                    Some(passive) => Some(passive),
+                    None => {
+                        busy_rounds += 1;
+                        wait_for = Some(CommitLock::Passive);
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            // Every lock is held. No await from here to the end.
+            self.apply_commit(
+                &mut states,
+                &mut active,
+                passive.as_deref_mut(),
+                to_demote,
+                peer,
+            );
+            return;
+        }
+    }
+
+    /// The peer that a commit demotes: the first one in a full active view.
+    fn demotion(&self, active: &HashSet<PeerId>) -> Option<PeerId> {
+        if active.len() >= self.config.active_degree {
+            active.iter().next().copied()
+        } else {
+            None
+        }
+    }
+
+    /// The changes of [`Self::commit_active`], with every lock held.
+    fn apply_commit(
+        &self,
+        states: &mut HashMap<PeerId, SwimPeerEntry>,
+        active: &mut HashSet<PeerId>,
+        passive: Option<&mut HashSet<PeerId>>,
+        to_demote: Option<PeerId>,
+        peer: PeerId,
+    ) {
+        if let Some(to_demote) = to_demote {
+            active.remove(&to_demote);
+            if let Some(passive) = passive {
+                if passive.len() < self.config.max_passive_degree {
+                    passive.insert(to_demote);
+                    debug!(peer_id = %to_demote, "Demoted to passive (active view full)");
+                }
+            }
+        }
+        active.insert(peer);
+        SwimDetector::<T>::set_alive(states, peer);
+        debug!(peer_id = %peer, "Added to active view");
+    }
+
+    /// [`Self::join_dial`], with `label` as the `seed` field of its logs.
+    async fn join_dial_labelled(
+        &self,
+        ledger: &mut JoinLedger,
+        addr: std::net::SocketAddr,
+        label: &(dyn std::fmt::Display + Sync),
+    ) -> JoinDial {
+        let state = ledger.seeds.entry(addr).or_default();
+        if state.attempts >= JOIN_MAX_ATTEMPTS {
+            return JoinDial::Exhausted;
+        }
+        if let Some(ready_at) = state.ready_at {
+            if ready_at > tokio::time::Instant::now() {
+                return JoinDial::NotReady { ready_at };
+            }
+        }
+        let attempt = state.attempts;
+        state.attempts += 1;
+        debug!(
+            seed = %label,
+            attempt = attempt + 1,
+            "JOIN: Connecting to bootstrap node"
+        );
+
+        // Connect via transport and get peer ID
+        match self.transport.dial_bootstrap(addr).await {
+            Ok(seed_peer_id) => {
+                debug!(
+                    seed = %label,
+                    peer_id = %seed_peer_id,
+                    "JOIN: Connected to bootstrap"
+                );
+                JoinDial::Answered(seed_peer_id)
+            }
+            Err(e) => {
+                let delay_ms = state.delay_ms;
+                warn!(
+                    seed = %label,
+                    attempt = attempt + 1,
+                    error = %e,
+                    delay_ms = delay_ms,
+                    "JOIN: Connection failed, will retry"
+                );
+
+                // Exponential backoff with jitter
+                let jitter = join_jitter_ms(delay_ms);
+                state.delay_ms = (delay_ms * 2).min(JOIN_MAX_DELAY_MS);
+                let retry_after = Duration::from_millis(delay_ms + jitter);
+                let dial_ready = tokio::time::Instant::now() + retry_after;
+                state.ready_at = Some(
+                    state
+                        .ready_at
+                        .map_or(dial_ready, |current| current.max(dial_ready)),
+                );
+                JoinDial::Failed {
+                    retry_after,
+                    exhausted: state.attempts >= JOIN_MAX_ATTEMPTS,
+                }
+            }
+        }
+    }
+
+    /// [`Self::join_send`], with `label` as the `seed` field of its logs.
+    async fn join_send_labelled(
+        &self,
+        addr: std::net::SocketAddr,
+        seed_peer_id: PeerId,
+        label: &(dyn std::fmt::Display + Sync),
+    ) -> Result<JoinSend> {
+        // Store peer address
+        self.store_peer_addr(seed_peer_id, addr).await;
+
+        // Send JOIN message
+        let join_msg = HyParViewMessage::Join {
+            sender: self.local_peer_id,
+            ttl: ACTIVE_RANDOM_WALK_LENGTH,
+        };
+
+        if let Err(e) = self.send_hyparview_message(seed_peer_id, &join_msg).await {
+            warn!(error = %e, "JOIN: Failed to send JOIN message");
+            return Ok(JoinSend::SendFailed);
+        }
+
+        // Add seed to active view immediately (optimistic). The commit
+        // takes all its locks before its first change, so a drop cannot
+        // leave the views or the SWIM state half updated.
+        self.add_active(seed_peer_id).await?;
+        debug!(seed = %label, "JOIN: Successfully joined network");
+        Ok(JoinSend::Joined)
     }
 
     /// Get the SWIM detector
@@ -1635,11 +2162,6 @@ impl<T: GossipTransport + 'static> Membership for HyParViewMembership<T> {
             return Ok(());
         }
 
-        // Exponential backoff parameters
-        const INITIAL_DELAY_MS: u64 = 100;
-        const MAX_DELAY_MS: u64 = 30_000;
-        const MAX_RETRIES: usize = 10;
-
         for seed in seeds {
             // Parse the seed address
             let addr: SocketAddr = match seed.parse() {
@@ -1650,66 +2172,26 @@ impl<T: GossipTransport + 'static> Membership for HyParViewMembership<T> {
                 }
             };
 
-            let mut delay_ms = INITIAL_DELAY_MS;
-            let mut connected = false;
-
-            for attempt in 0..MAX_RETRIES {
-                debug!(
-                    seed = %seed,
-                    attempt = attempt + 1,
-                    "JOIN: Connecting to bootstrap node"
-                );
-
-                // Connect via transport and get peer ID
-                match self.transport.dial_bootstrap(addr).await {
-                    Ok(seed_peer_id) => {
-                        debug!(
-                            seed = %seed,
-                            peer_id = %seed_peer_id,
-                            "JOIN: Connected to bootstrap"
-                        );
-
-                        // Store peer address
-                        self.store_peer_addr(seed_peer_id, addr).await;
-
-                        // Send JOIN message
-                        let join_msg = HyParViewMessage::Join {
-                            sender: self.local_peer_id,
-                            ttl: ACTIVE_RANDOM_WALK_LENGTH,
-                        };
-
-                        if let Err(e) = self.send_hyparview_message(seed_peer_id, &join_msg).await {
-                            warn!(error = %e, "JOIN: Failed to send JOIN message");
-                            continue;
+            // A fresh retry state for each seed-list entry: up to
+            // JOIN_MAX_ATTEMPTS dials, backoff only after a failed dial.
+            let mut ledger = JoinLedger::new();
+            loop {
+                match self.join_dial_labelled(&mut ledger, addr, &seed).await {
+                    JoinDial::Answered(seed_peer_id) => {
+                        match self.join_send_labelled(addr, seed_peer_id, &seed).await? {
+                            // Successfully joined via this seed
+                            JoinSend::Joined => return Ok(()),
+                            JoinSend::SendFailed => {}
                         }
-
-                        // Add seed to active view immediately (optimistic)
-                        self.add_active(seed_peer_id).await?;
-                        connected = true;
-                        break;
                     }
-                    Err(e) => {
-                        warn!(
-                            seed = %seed,
-                            attempt = attempt + 1,
-                            error = %e,
-                            delay_ms = delay_ms,
-                            "JOIN: Connection failed, will retry"
-                        );
-
-                        // Exponential backoff with jitter
-                        let jitter =
-                            (rand::random::<u64>() % (delay_ms / 4)).saturating_sub(delay_ms / 8);
-                        tokio::time::sleep(Duration::from_millis(delay_ms + jitter)).await;
-                        delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+                    JoinDial::Failed { retry_after, .. } => {
+                        tokio::time::sleep(retry_after).await;
                     }
+                    // Not reached: the sleep above ends at or after the
+                    // seed's readiness. Kept so the loop never dials early.
+                    JoinDial::NotReady { ready_at } => tokio::time::sleep_until(ready_at).await,
+                    JoinDial::Exhausted => break,
                 }
-            }
-
-            if connected {
-                // Successfully joined via this seed
-                debug!(seed = %seed, "JOIN: Successfully joined network");
-                return Ok(());
             }
         }
 
@@ -1739,27 +2221,7 @@ impl<T: GossipTransport + 'static> Membership for HyParViewMembership<T> {
     }
 
     async fn add_active(&self, peer: PeerId) -> Result<()> {
-        let mut active = self.active.write().await;
-
-        // If active view is full, demote one peer to passive
-        if active.len() >= self.config.active_degree {
-            if let Some(&to_demote) = active.iter().next() {
-                active.remove(&to_demote);
-                // Move to passive view
-                let mut passive = self.passive.write().await;
-                if passive.len() < self.config.max_passive_degree {
-                    passive.insert(to_demote);
-                    debug!(peer_id = %to_demote, "Demoted to passive (active view full)");
-                }
-            }
-        }
-
-        active.insert(peer);
-        drop(active); // Release lock before async call
-
-        self.swim.mark_alive(peer).await;
-        debug!(peer_id = %peer, "Added to active view");
-
+        self.commit_active(peer).await;
         Ok(())
     }
 
@@ -1789,6 +2251,9 @@ impl<T: GossipTransport + 'static> Membership for HyParViewMembership<T> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod join_budget_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

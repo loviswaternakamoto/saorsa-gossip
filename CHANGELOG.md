@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **membership: a step-by-step JOIN API with one retry ledger per seed (for
+  x0x#1321).** `HyParViewMembership::join_dial(&mut JoinLedger, seed)` makes
+  one JOIN dial and returns `JoinDial::{Answered(peer), Failed { retry_after,
+  exhausted }, Exhausted}`. `HyParViewMembership::join_send(seed, peer)` stores
+  the seed address, sends the JOIN frame and adds the peer to the active view,
+  and returns `JoinSend::{Joined, SendFailed}`. Between the two steps a caller
+  can decide whether the answered peer gets the JOIN frame (x0x checks its
+  gossip-plane admission there). One `JoinLedger` keeps each seed address's
+  attempts (`JOIN_MAX_ATTEMPTS` = 10) and backoff (`JOIN_INITIAL_DELAY_MS` =
+  100, doubled after each failed dial up to `JOIN_MAX_DELAY_MS` = 30 000)
+  across the caller's candidate changes. Only a failed dial grows the backoff;
+  a failed send allows the next attempt at once.
+  `JoinLedger::record_loss(seed)` reports that the answered peer lost its
+  connection before the JOIN frame went out; it starts a per-seed loss
+  cooldown (100 ms, doubled after each loss up to 30 s, plus the same jitter)
+  that answered dials do not reset (x0x D252). `JoinLedger::ready_at(seed)` is
+  the later of the dial backoff and the loss cooldown; `join_dial` makes no
+  dial before it (`JoinDial::NotReady`, no attempt used). Both steps are safe
+  to drop and spawn no task. The local commit (active view, passive demotion,
+  SWIM alive mark; also the body of `Membership::add_active`) takes all its
+  locks before its first change and does not await after that, so neither a
+  drop nor a runtime shutdown leaves the views half updated. A drop while it
+  waits for a lock changes nothing; the seed can then have the JOIN frame. It
+  does not hold one of its locks (SWIM state, active view, passive view)
+  while it waits for another: it takes them with `try_write`, and when one is
+  busy it releases the others and waits for that one alone. So view
+  contention does not delay SWIM, and `active_view()` does not read as empty
+  while a commit waits. After eight busy rounds it waits in the fixed order,
+  which bounds the retries.
+  `Membership::join` keeps its signature and behaviour and now runs on these
+  steps; a differential test compares it frame for frame, side effect for
+  side effect and backoff for backoff with a verbatim copy of the 0.5.87 loop
+  and `add_active`. As in 0.5.87, its success path needs no entered Tokio
+  runtime; its backoff sleeps use a Tokio timer. See ADR-015.
+
+### Fixed
+
+- **membership: an on-time SWIM ACK no longer loses to the probe timeout.**
+  The probe-timeout task scans the pending probes and then takes the SWIM
+  state lock. An ACK that arrived between the two still had its sender
+  marked Suspect. For each overdue probe the task now takes the probe table
+  (read) and then the state lock, and re-checks that the same probe is still
+  pending; `handle_ack` / `handle_ack_response` clear the probe before they
+  mark the peer alive. So an ACK that cleared the probe after the scan is
+  seen by the re-check, and a later ACK marks the peer alive after the
+  timeout's write. Both waits are fair, so a busy probe table delays the
+  re-check but cannot skip it: the first scan that finds an overdue probe
+  decides it.
+
 ## [0.5.87] - 2026-10-04
 
 ### Fixed

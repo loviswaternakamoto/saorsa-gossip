@@ -34,6 +34,7 @@ Saorsa Gossip is a **post-quantum secure, fully decentralized gossip overlay net
 | [ADR-010](ADR-010-deterministic-simulator.md) | Deterministic Network Simulator | **Retired** | 2026-01-16 |
 | [ADR-013](ADR-013-explicit-legacy-gossip-egress.md) | Explicit Legacy Gossip Egress During the Payload-Signature Migration | Accepted (stock release-support / Validation§6 / Options§3 superseded by ADR-014) | 2026-09-06 |
 | [ADR-014](ADR-014-modern-only-release-support.md) | Modern-Only Release Support and RejectV1 Default | Accepted | 2026-09-07 |
+| [ADR-015](ADR-015-step-by-step-join-api.md) | Step-by-Step JOIN API with a Caller-Held Retry Ledger | Accepted | 2026-10-12 |
 
 ## Architecture Layers
 
