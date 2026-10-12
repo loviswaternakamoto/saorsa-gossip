@@ -446,6 +446,7 @@ async fn run_steps(scenario: &Scenario) -> (Outcome, Vec<TokioInstant>) {
                     }
                 },
                 JoinDial::Failed { retry_after, .. } => tokio::time::sleep(retry_after).await,
+                JoinDial::NotReady { ready_at } => tokio::time::sleep_until(ready_at).await,
                 JoinDial::Exhausted => break,
             }
         }
@@ -622,6 +623,19 @@ async fn join_send_sends_the_join_frame_to_the_answered_peer() {
     );
 }
 
+/// One `join_dial` on `seed` once its readiness has come: the caller's
+/// obligation to wait `retry_after` (or `ready_at`) between attempts.
+async fn dial_when_ready(
+    membership: &HyParViewMembership<ScriptedTransport>,
+    ledger: &mut JoinLedger,
+    seed: SocketAddr,
+) -> JoinDial {
+    if let Some(ready_at) = ledger.ready_at(seed) {
+        tokio::time::sleep_until(ready_at).await;
+    }
+    membership.join_dial(ledger, seed).await
+}
+
 /// One ledger across candidates: each seed keeps its own attempts and
 /// backoff while the caller turns between seeds, and a seed that used its
 /// attempts stays exhausted (no dial).
@@ -631,14 +645,14 @@ async fn the_ledger_keeps_each_seed_budget_across_candidates() {
     let mut ledger = JoinLedger::new();
 
     for round in 0..JOIN_MAX_ATTEMPTS {
-        let a = membership.join_dial(&mut ledger, addr(A)).await;
+        let a = dial_when_ready(&membership, &mut ledger, addr(A)).await;
         let JoinDial::Failed { exhausted, .. } = a else {
             panic!("A dial {round}: {a:?}");
         };
         assert_eq!(exhausted, round + 1 == JOIN_MAX_ATTEMPTS);
         if round < 3 {
             assert!(matches!(
-                membership.join_dial(&mut ledger, addr(B)).await,
+                dial_when_ready(&membership, &mut ledger, addr(B)).await,
                 JoinDial::Failed { .. }
             ));
         }
@@ -651,7 +665,7 @@ async fn the_ledger_keeps_each_seed_budget_across_candidates() {
 
     let dials_before = transport.dial_addrs().len();
     assert_eq!(
-        membership.join_dial(&mut ledger, addr(A)).await,
+        dial_when_ready(&membership, &mut ledger, addr(A)).await,
         JoinDial::Exhausted
     );
     assert_eq!(
@@ -776,7 +790,7 @@ async fn the_last_attempt_is_reported_and_then_no_dial() {
     let mut ledger = JoinLedger::new();
     let mut retries = Vec::new();
     for _ in 0..JOIN_MAX_ATTEMPTS {
-        match membership.join_dial(&mut ledger, addr(A)).await {
+        match dial_when_ready(&membership, &mut ledger, addr(A)).await {
             JoinDial::Failed {
                 retry_after,
                 exhausted,
@@ -793,10 +807,28 @@ async fn the_last_attempt_is_reported_and_then_no_dial() {
         assert_eq!(*exhausted, i + 1 == JOIN_MAX_ATTEMPTS);
     }
     assert_eq!(
-        membership.join_dial(&mut ledger, addr(A)).await,
+        dial_when_ready(&membership, &mut ledger, addr(A)).await,
         JoinDial::Exhausted
     );
     assert_eq!(transport.dial_addrs().len(), JOIN_MAX_ATTEMPTS);
+}
+
+/// A `join_dial` before the seed's backoff ends makes no dial and uses no
+/// attempt: saorsa-gossip enforces the wait.
+#[tokio::test(start_paused = true)]
+async fn an_early_dial_is_refused_without_using_an_attempt() {
+    let (membership, transport) = membership(Script::default());
+    let mut ledger = JoinLedger::new();
+    let JoinDial::Failed { .. } = membership.join_dial(&mut ledger, addr(A)).await else {
+        panic!("the first dial fails");
+    };
+    let ready_at = ledger.ready_at(addr(A)).unwrap();
+    assert_eq!(
+        membership.join_dial(&mut ledger, addr(A)).await,
+        JoinDial::NotReady { ready_at }
+    );
+    assert_eq!(ledger.attempts(addr(A)), 1);
+    assert_eq!(transport.dial_addrs().len(), 1);
 }
 
 /// Codex re-review of a2100a7, finding 2: a dropped `join_send` does not
@@ -897,4 +929,120 @@ async fn a_dropped_send_leaves_a_consistent_view_when_the_swim_lock_is_held() {
         membership.swim().get_state(&joining).await,
         Some(PeerState::Alive)
     );
+}
+
+/// The time from now until `at`, in milliseconds.
+fn millis_until(at: TokioInstant) -> u64 {
+    at.duration_since(TokioInstant::now()).as_millis() as u64
+}
+
+/// D252: the loss cooldown. A peer that answered the dial and then lost its
+/// connection is reported with `record_loss`. The next attempt on that seed
+/// waits 100 ms, then 200 ms, and so on up to 30 s, plus at most 1/8
+/// jitter. A dial before then makes no dial and uses no attempt. Answered
+/// dials do not reset the cooldown, and losses do not change the dial
+/// backoff.
+#[tokio::test(start_paused = true)]
+async fn record_loss_paces_a_seed_that_answers_and_closes() {
+    let (membership, transport) = membership(Script {
+        dials: HashMap::from([(addr(A), vec![answers(peer(1))])]),
+        ..Script::default()
+    });
+    let mut ledger = JoinLedger::new();
+    let mut cooldown = JOIN_INITIAL_DELAY_MS;
+    for attempt in 1..=JOIN_MAX_ATTEMPTS {
+        assert_eq!(
+            membership.join_dial(&mut ledger, addr(A)).await,
+            JoinDial::Answered(peer(1))
+        );
+        let ready_at = ledger.record_loss(addr(A));
+        let waited = millis_until(ready_at);
+        assert!(
+            waited >= cooldown && waited <= cooldown + cooldown / 8,
+            "loss {attempt}: cooldown {waited} ms, expected {cooldown} ms plus at most 1/8 jitter"
+        );
+        assert_eq!(ledger.ready_at(addr(A)), Some(ready_at));
+        if attempt < JOIN_MAX_ATTEMPTS {
+            let dials = transport.dial_addrs().len();
+            assert_eq!(
+                membership.join_dial(&mut ledger, addr(A)).await,
+                JoinDial::NotReady { ready_at },
+                "no dial before the cooldown ends"
+            );
+            assert_eq!(transport.dial_addrs().len(), dials);
+            assert_eq!(ledger.attempts(addr(A)), attempt);
+            tokio::time::sleep_until(ready_at).await;
+        }
+        cooldown = (cooldown * 2).min(JOIN_MAX_DELAY_MS);
+        assert_eq!(ledger.delay_ms(addr(A)), JOIN_INITIAL_DELAY_MS);
+    }
+    assert_eq!(transport.dial_addrs().len(), JOIN_MAX_ATTEMPTS);
+    assert_eq!(
+        membership.join_dial(&mut ledger, addr(A)).await,
+        JoinDial::Exhausted
+    );
+    assert!(transport.join_frames().is_empty());
+}
+
+/// D252: the readiness is the later of the dial backoff and the loss
+/// cooldown; the delays are not added.
+#[tokio::test(start_paused = true)]
+async fn the_later_of_backoff_and_loss_cooldown_wins() {
+    let (membership, _transport) = membership(Script::default());
+    let mut ledger = JoinLedger::new();
+    // Four failed dials: the next dial backoff is 1.6 s.
+    for _ in 0..4 {
+        if let JoinDial::Failed { retry_after, .. } =
+            membership.join_dial(&mut ledger, addr(A)).await
+        {
+            tokio::time::sleep(retry_after).await;
+        }
+    }
+    let JoinDial::Failed { retry_after, .. } = membership.join_dial(&mut ledger, addr(A)).await
+    else {
+        panic!("the fifth dial fails");
+    };
+    let dial_ready = ledger.ready_at(addr(A)).unwrap();
+    assert_eq!(millis_until(dial_ready), retry_after.as_millis() as u64);
+    // A loss now (100 ms cooldown) ends before the 1.6 s backoff: the
+    // backoff wins, and the two are not added.
+    let ready = ledger.record_loss(addr(A));
+    assert_eq!(ready, dial_ready);
+    assert_eq!(ledger.loss_delay_ms(addr(A)), 2 * JOIN_INITIAL_DELAY_MS);
+    assert_eq!(ledger.delay_ms(addr(A)), 3200);
+}
+
+/// D252: the loss cooldown and the attempts belong to the seed address,
+/// across candidate changes: another seed is unaffected and can be dialled
+/// while the lost one waits.
+#[tokio::test(start_paused = true)]
+async fn a_lost_seed_waits_while_another_seed_is_dialled() {
+    let (membership, transport) = membership(Script {
+        dials: HashMap::from([
+            (addr(A), vec![answers(peer(1))]),
+            (addr(B), vec![answers(peer(2))]),
+        ]),
+        ..Script::default()
+    });
+    let mut ledger = JoinLedger::new();
+    assert_eq!(
+        membership.join_dial(&mut ledger, addr(A)).await,
+        JoinDial::Answered(peer(1))
+    );
+    let a_ready = ledger.record_loss(addr(A));
+    assert!(matches!(
+        membership.join_dial(&mut ledger, addr(A)).await,
+        JoinDial::NotReady { .. }
+    ));
+    assert_eq!(
+        membership.join_dial(&mut ledger, addr(B)).await,
+        JoinDial::Answered(peer(2))
+    );
+    assert_eq!(
+        membership.join_send(addr(B), peer(2)).await.unwrap(),
+        JoinSend::Joined
+    );
+    assert_eq!(ledger.ready_at(addr(B)), None);
+    assert_eq!(ledger.ready_at(addr(A)), Some(a_ready));
+    assert_eq!(transport.dial_addrs(), vec![addr(A), addr(B)]);
 }
