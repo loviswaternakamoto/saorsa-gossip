@@ -51,10 +51,11 @@ We will add option 1 to `saorsa-gossip-membership`, as additive public API:
 6. **Cancellation.** Both futures can be dropped; a runtime shutdown drops them in the same way. A dropped future gives no result.
    - A dropped dial counts as an attempt and does not change the backoff.
    - Until the transport's send returns `Ok`, a dropped `join_send` leaves only the stored address. The transport can have sent the frame before that, so the seed can have the JOIN.
-   - Then the local commit (the active-view insert, a demotion to the passive view when the view is full, and the SWIM alive mark) takes every lock that it needs before its first change: the active view, the passive view when a demotion is due, then the SWIM state. After that it does not await. A drop while it waits for a lock changes nothing: the seed can have the JOIN while this node does not list the seed (as a drop at the same point of the 0.5.87 `join`). No executor can stop the commit between its first and its last change. If a lock never becomes free, the future waits.
+   - Then the local commit (the active-view insert, a demotion to the passive view when the view is full, and the SWIM alive mark) takes every lock that it needs before its first change: the SWIM state, the active view, then the passive view when a demotion is due. After that it does not await. A drop while it waits for a lock changes nothing: the seed can have the JOIN while this node does not list the seed. No executor can stop the commit between its first and its last change. If a lock never becomes free, the future waits.
+   - This is deliberately different from 0.5.87. There, a drop while `add_active` waited for the passive-view lock left the demoted peer in neither view, and a drop while it waited for the SWIM lock left the new peer active but not alive.
    - `Membership::add_active` uses the same commit.
 7. **Runtime.** `join_dial` and `join_send` spawn no task and start no timer, so they run on any executor; the transport can have its own needs. As in 0.5.87, `HyParViewMembership::new` needs a Tokio runtime (it starts background tasks), and `Membership::join` sleeps for its backoff with a Tokio timer. Its success path needs no entered runtime.
-8. **Legacy `join`.** `Membership::join` runs on the same steps, with a fresh ledger per entry. It never reports a loss. Its dials, frames, stored addresses, views, SWIM states, results and backoff are as in 0.5.87 (the differential test). Concurrent scheduling can differ, because the commit holds the active-view lock until it has the SWIM lock.
+8. **Legacy `join`.** `Membership::join` runs on the same steps, with a fresh ledger per entry. It never reports a loss. For a run that completes, its dials, frames, stored addresses, views, SWIM states, results and backoff are as in 0.5.87 (the differential test). This is not a claim about cancellation (see 6) or about concurrent observations: the commit takes its locks in a different order and holds them together.
 
 ## Consequences
 
@@ -67,7 +68,9 @@ We will add option 1 to `saorsa-gossip-membership`, as additive public API:
 ### Negative / Trade-offs
 
 - A larger public API that callers must use correctly.
-- The commit holds the active-view lock while it waits for the passive-view and SWIM locks. `active_view()` (a `try_read`) returns an empty list during that time, as it already did while the 0.5.87 `add_active` waited for the passive-view lock. No code path takes these locks in the reverse order, so there is no new lock-order cycle.
+- `active_view()` uses `try_read` and returns an empty list while the active-view lock is held. The commit takes the SWIM lock before any view lock, so a wait for SWIM does not hide the view. One window remains, unchanged from 0.5.87: a commit that demotes holds the active-view lock while it waits for the passive-view lock. A reader in that window sees no peers for that call. The coordinator advert then sends nothing, an uncached FOAF lookup returns an empty result, and x0x stale-target maintenance skips pruning for that pass and can re-add a peer that is already active. A snapshot behind `active_view()` would remove this window; it is out of scope here.
+- The commit holds the SWIM lock while it waits for the view locks, so async SWIM readers wait for it. No reader of SWIM state uses `try_read`.
+- Lock order: SWIM state, then active view, then passive view. No code path holds a view lock while it takes the SWIM lock, and active before passive is also the order of degree maintenance, so there is no lock-order cycle.
 
 ### Neutral / Operational
 
@@ -75,7 +78,7 @@ We will add option 1 to `saorsa-gossip-membership`, as additive public API:
 
 ## Validation
 
-- `join_budget_tests.rs`: a differential test against a verbatim copy of the 0.5.87 loop and `add_active` (dials, frames, stored addresses, views, SWIM state, results and backoff gaps); the ledger across candidates; backoff only on a failed dial; a gate refusal before the send; the loss cooldown; the readiness rule; early-dial refusal; safe drops; two lock-contention drop tests; a runtime shutdown while the commit waits for a lock; the legacy `join` polled outside a runtime; a full-view demotion against the 0.5.87 `add_active`.
+- `join_budget_tests.rs`: a differential test against a verbatim copy of the 0.5.87 loop and `add_active` (dials, frames, stored addresses, views, SWIM state, results and backoff gaps); the ledger across candidates; backoff only on a failed dial; a gate refusal before the send; the loss cooldown; the readiness rule; early-dial refusal; safe drops; two lock-contention drop tests; a runtime shutdown while the commit waits for a lock; the legacy `join` polled outside a runtime; a full-view demotion against the 0.5.87 `add_active`; `active_view()` while a commit waits for the SWIM lock.
 - Review trigger: any change to `join`, `add_active` or the JOIN frame.
 
 ## Notes for AI-assisted work
