@@ -1227,10 +1227,13 @@ async fn record_overdue_probe<T: GossipTransport + 'static>(
 /// Codex re-review of 43af9eb, finding 1: SWIM progress must not wait for
 /// view-lock contention. Deterministic: a paused clock drives the timeout
 /// scans (every 500 ms of Tokio time), the probe is backdated, and lock
-/// guards set the order. P has an overdue probe; the next scan runs at
-/// 1000 ms. A view holder keeps the active-view lock across that scan, and
-/// `add_active(Q)` waits for it. P's ACK arrives at 950 ms, before the
-/// scan. The ACK must complete at once and P must stay alive. At 43af9eb
+/// guards set the order. The test ends before the first automatic SWIM
+/// probe round (1000 ms), so no probe that reads the live std clock exists
+/// (Codex re-review of a3b039a). P has an overdue probe; the first scan
+/// runs at 500 ms. A view holder keeps the active-view lock across that
+/// scan, and `add_active(Q)` waits for it. P's ACK arrives at 450 ms,
+/// before the scan. The ACK must complete at once and P must stay alive.
+/// At 43af9eb
 /// the commit held the SWIM state lock while it waited: the ACK queued
 /// behind it, and the queued timeout write then turned Alive into Suspect.
 #[tokio::test(start_paused = true)]
@@ -1240,12 +1243,11 @@ async fn an_ack_before_the_scan_wins_while_a_commit_waits_for_a_view_lock() {
     let t0 = background_tasks_started().await;
     let target = peer(7);
 
-    // After the scan at 500 ms, P gets an overdue probe.
-    tokio::time::sleep_until(t0 + ms(510)).await;
+    tokio::time::sleep_until(t0 + ms(10)).await;
     membership.swim.mark_alive(target).await;
     record_overdue_probe(&membership, target).await;
 
-    tokio::time::sleep_until(t0 + ms(900)).await;
+    tokio::time::sleep_until(t0 + ms(400)).await;
     let view_guard = Arc::clone(&membership.active).write_owned().await;
     let committer = {
         let membership = Arc::clone(&membership);
@@ -1256,15 +1258,15 @@ async fn an_ack_before_the_scan_wins_while_a_commit_waits_for_a_view_lock() {
         !committer.is_finished(),
         "scenario: the commit waits for the view lock"
     );
-    tokio::time::sleep_until(t0 + ms(950)).await;
+    tokio::time::sleep_until(t0 + ms(450)).await;
     let ack = {
         let swim = Arc::clone(&membership.swim);
         tokio::spawn(async move { swim.handle_ack(target).await })
     };
     settle().await;
     let ack_done_while_the_view_was_held = ack.is_finished();
-    // The scan at 1000 ms runs while the view lock is still held.
-    tokio::time::sleep_until(t0 + ms(1001)).await;
+    // The scan at 500 ms runs while the view lock is still held.
+    tokio::time::sleep_until(t0 + ms(501)).await;
     drop(view_guard);
     committer.await.unwrap().unwrap();
     ack.await.unwrap().unwrap();
@@ -1280,13 +1282,18 @@ async fn an_ack_before_the_scan_wins_while_a_commit_waits_for_a_view_lock() {
         "the ACK must not wait for the view-lock contention"
     );
     assert!(membership.active_view().contains(&peer(8)));
+    assert!(
+        TokioInstant::now() < t0 + ms(1000),
+        "fixture: the test ends before the first automatic probe round"
+    );
 }
 
 /// The probe-timeout re-check (Codex re-review of 43af9eb), deterministic:
 /// an ACK that completes between the timeout scan and the timeout's
-/// re-check wins, and the timeout does not act on the answered probe. P has
-/// an overdue probe. A holder keeps the probe table from 990 ms to 1001 ms,
-/// so the scan at 1000 ms waits for it, and P's ACK then queues for the
+/// re-check wins, and the timeout does not act on the answered probe. Like
+/// the test above, it ends before the first automatic probe round. P has
+/// an overdue probe. A holder keeps the probe table from 490 ms to 501 ms,
+/// so the scan at 500 ms waits for it, and P's ACK then queues for the
 /// table behind the scan. When the holder lets go, the scan finds P overdue
 /// and the ACK clears P's probe before the timeout re-checks it. At
 /// 43af9eb the timeout marked P suspect and asked W for an indirect probe
@@ -1299,16 +1306,16 @@ async fn an_ack_between_the_timeout_scan_and_its_recheck_wins() {
     let witness = peer(9);
     membership.swim.mark_alive(witness).await;
 
-    tokio::time::sleep_until(t0 + ms(510)).await;
+    tokio::time::sleep_until(t0 + ms(10)).await;
     membership.swim.mark_alive(target).await;
     record_overdue_probe(&membership, target).await;
 
-    tokio::time::sleep_until(t0 + ms(990)).await;
+    tokio::time::sleep_until(t0 + ms(490)).await;
     let table_guard = Arc::clone(&membership.swim.pending_probes)
         .write_owned()
         .await;
-    // The scan at 1000 ms waits for the table.
-    tokio::time::sleep_until(t0 + ms(1001)).await;
+    // The scan at 500 ms waits for the table.
+    tokio::time::sleep_until(t0 + ms(501)).await;
     let ack = {
         let swim = Arc::clone(&membership.swim);
         tokio::spawn(async move { swim.handle_ack(target).await })
@@ -1324,6 +1331,10 @@ async fn an_ack_between_the_timeout_scan_and_its_recheck_wins() {
         "the timeout acted on a probe that the ACK had answered"
     );
     assert_eq!(swim_state(&membership, target), Some(PeerState::Alive));
+    assert!(
+        TokioInstant::now() < t0 + ms(1000),
+        "fixture: the test ends before the first automatic probe round"
+    );
 }
 
 /// Codex re-review of 104fde5, finding 1: repeated probe-table contention
