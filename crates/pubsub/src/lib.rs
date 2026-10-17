@@ -747,6 +747,75 @@ impl PubSubMessageKindStats {
     }
 }
 
+/// Number of [`MessageKind`] variants (`to_u8()` ranges `0..=8`).
+const MESSAGE_KIND_VARIANT_COUNT: usize = 9;
+
+/// Cumulative ML-DSA verify counters for one [`MessageKind`].
+///
+/// Produced by [`PerKindVerifyMeterSnapshot`]; never reset by a read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KindVerifyCounters {
+    /// Times an outer ML-DSA signature verify was attempted for this kind.
+    pub attempts: u64,
+    /// Times that verify returned invalid (or errored).
+    pub failures: u64,
+    /// Cumulative wall time spent in those verifies, in nanoseconds.
+    pub total_ns: u64,
+}
+
+/// Cheap snapshot of per-[`MessageKind`] outer-signature verify meters.
+///
+/// Indexed by [`MessageKind::to_u8`] as `usize` (`0..=8`). Cumulative and
+/// monotonic: reads never reset the underlying counters. Independent of
+/// [`PlumtreePubSub::stage_stats`] — atomic loads only, no topic/peer locks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PerKindVerifyMeterSnapshot {
+    /// Per-kind counters; index `kind.to_u8() as usize`.
+    pub by_kind: [KindVerifyCounters; MESSAGE_KIND_VARIANT_COUNT],
+}
+
+impl PerKindVerifyMeterSnapshot {
+    /// Counters for a single wire kind.
+    #[must_use]
+    pub fn for_kind(self, kind: MessageKind) -> KindVerifyCounters {
+        self.by_kind[kind.to_u8() as usize]
+    }
+}
+
+/// Lock-free per-kind outer ML-DSA verify meters (x0x#1170 / Track E M1).
+///
+/// Recorded at the signature-verify call site under the frame's
+/// [`MessageKind`]. `Relaxed` atomics; safe across concurrent receive workers.
+#[derive(Debug, Default)]
+struct PerKindVerifyMeter {
+    attempts: [AtomicU64; MESSAGE_KIND_VARIANT_COUNT],
+    failures: [AtomicU64; MESSAGE_KIND_VARIANT_COUNT],
+    total_ns: [AtomicU64; MESSAGE_KIND_VARIANT_COUNT],
+}
+
+impl PerKindVerifyMeter {
+    fn record(&self, kind: MessageKind, success: bool, duration: Duration) {
+        let idx = kind.to_u8() as usize;
+        self.attempts[idx].fetch_add(1, Ordering::Relaxed);
+        if !success {
+            self.failures[idx].fetch_add(1, Ordering::Relaxed);
+        }
+        self.total_ns[idx].fetch_add(duration_to_ns(duration), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> PerKindVerifyMeterSnapshot {
+        let mut by_kind = [KindVerifyCounters::default(); MESSAGE_KIND_VARIANT_COUNT];
+        for (idx, slot) in by_kind.iter_mut().enumerate() {
+            *slot = KindVerifyCounters {
+                attempts: self.attempts[idx].load(Ordering::Relaxed),
+                failures: self.failures[idx].load(Ordering::Relaxed),
+                total_ns: self.total_ns[idx].load(Ordering::Relaxed),
+            };
+        }
+        PerKindVerifyMeterSnapshot { by_kind }
+    }
+}
+
 /// Timing counters for one PubSub processing stage.
 #[derive(Debug, Default)]
 pub struct StageTimingStats {
@@ -4277,6 +4346,13 @@ struct IhaveFlushWork {
     retained_announce: bool,
 }
 
+/// One bounded payload replay entry. Keep refusal with the payload digest so
+/// a fresh outer ID cannot turn rejected bytes into a serveable cache entry.
+struct PayloadReplayEntry {
+    inserted_at: Instant,
+    refused: bool,
+}
+
 struct TopicState {
     /// Spanning tree peers (forward EAGER)
     eager_peers: HashSet<PeerId>,
@@ -4345,11 +4421,11 @@ struct TopicState {
     peer_scores: HashMap<PeerId, PeerScore>,
     /// Local subscribers
     subscribers: Vec<mpsc::UnboundedSender<(PeerId, Bytes)>>,
-    /// Payload-level replay cache: BLAKE3(payload) -> insertion time.
+    /// Payload-level replay cache: BLAKE3(payload) -> time and refusal.
     ///
     /// Catches replays where the same application payload is wrapped in a
     /// different gossip envelope (different epoch, sender, msg_id).
-    replay_cache: LruCache<[u8; 32], Instant>,
+    replay_cache: LruCache<[u8; 32], PayloadReplayEntry>,
     /// TTL for replay cache entries.
     replay_ttl: Duration,
     /// Last time this topic saw any activity (publish, incoming, IHAVE, etc).
@@ -4736,13 +4812,36 @@ impl TopicState {
     fn is_payload_replay(&mut self, payload: &[u8]) -> bool {
         self.touch();
         let key: [u8; 32] = *blake3::hash(payload).as_bytes();
-        if let Some(ts) = self.replay_cache.get(&key) {
-            if ts.elapsed() < self.replay_ttl {
+        if let Some(entry) = self.replay_cache.get(&key) {
+            if entry.inserted_at.elapsed() < self.replay_ttl {
                 return true;
             }
         }
-        self.replay_cache.put(key, Instant::now());
+        self.replay_cache.put(
+            key,
+            PayloadReplayEntry {
+                inserted_at: Instant::now(),
+                refused: false,
+            },
+        );
         false
+    }
+
+    /// Remember the validator's Drop for this payload, without adding a new
+    /// cache or changing replay TTL/count bounds. Called under the topic lock.
+    fn refuse_payload_replays(&mut self, payload: &[u8]) {
+        let key = *blake3::hash(payload).as_bytes();
+        if let Some(entry) = self.replay_cache.get_mut(&key) {
+            entry.refused = true;
+        }
+    }
+
+    /// Called only after `is_payload_replay` confirms the entry is live.
+    fn payload_replay_was_refused(&mut self, payload: &[u8]) -> bool {
+        let key = *blake3::hash(payload).as_bytes();
+        self.replay_cache
+            .get(&key)
+            .is_some_and(|entry| entry.refused)
     }
 
     /// Get all cached message IDs for anti-entropy digest
@@ -5414,8 +5513,8 @@ impl TopicState {
         let replay_ttl = self.replay_ttl;
         let now = Instant::now();
         let mut expired_replay = Vec::new();
-        for (hash, ts) in self.replay_cache.iter() {
-            if now.saturating_duration_since(*ts) > replay_ttl {
+        for (hash, entry) in self.replay_cache.iter() {
+            if now.saturating_duration_since(entry.inserted_at) > replay_ttl {
                 expired_replay.push(*hash);
             }
         }
@@ -6960,6 +7059,9 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     signing_key: Arc<saorsa_gossip_identity::MlDsaKeyPair>,
     /// Low-overhead timing counters for inbound PubSub processing stages.
     stage_stats: Arc<PubSubStageStats>,
+    /// Per-[`MessageKind`] outer ML-DSA verify meters (attempts / failures /
+    /// cumulative ns). Independent of [`Self::stage_stats`]; lock-free reads.
+    verify_by_kind: Arc<PerKindVerifyMeter>,
     /// Verified outer signer keys and negotiated per-session wire capability.
     key_cache: Arc<Mutex<key_cache::KeyCache>>,
     /// Last complete peer-score diagnostics snapshot.
@@ -7803,6 +7905,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             transport,
             signing_key,
             stage_stats: Arc::new(PubSubStageStats::default()),
+            verify_by_kind: Arc::new(PerKindVerifyMeter::default()),
             key_cache,
             peer_score_snapshot: Arc::new(StdRwLock::new(Arc::new(Vec::new()))),
             topic_cache_snapshot: Arc::new(StdRwLock::new(Arc::new(Vec::new()))),
@@ -8058,6 +8161,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         snapshot.topic_shard_count = self.topics.shard_count();
         snapshot.peer_scoring_lock_wait = self.peer_scoring.lock_wait_snapshot();
         snapshot
+    }
+
+    /// Cumulative per-[`MessageKind`] outer ML-DSA verify counters.
+    ///
+    /// Recorded at the signature-verify call site under the kind of the frame
+    /// being verified. Cheap: atomic loads only — does **not** call
+    /// [`Self::stage_stats`] and does not take topic/peer locks. Reads never
+    /// reset the counters (monotonic for the lifetime of this pubsub instance).
+    ///
+    /// Intended for x0x Track E per-kind verify cost (x0x#1170): sample this
+    /// instead of diffing [`Self::stage_stats`] around each inbound frame.
+    #[must_use]
+    pub fn verify_by_kind_stats(&self) -> PerKindVerifyMeterSnapshot {
+        self.verify_by_kind.snapshot()
     }
 
     /// Snapshot only the bounded per-topic outbound meters.
@@ -8377,9 +8494,12 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         ) {
             return false;
         }
-        let verified =
-            self.verify_signature(&message.header, &message.signature, &message.public_key)
-                && self.verify_payload_covering_signature(message);
+        let crypto_started = Instant::now();
+        let sig_ok =
+            self.verify_signature(&message.header, &message.signature, &message.public_key);
+        self.verify_by_kind
+            .record(message.header.kind, sig_ok, crypto_started.elapsed());
+        let verified = sig_ok && self.verify_payload_covering_signature(message);
         self.record_stage(PubSubStage::Verify, verify_started);
         verified
     }
@@ -10697,6 +10817,11 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
         // We keep the msg_id cache entry (already done above) so PlumTree's
         // PRUNE/GRAFT still works, but skip subscriber delivery and forwarding.
         if state.is_payload_replay(&payload) {
+            // #116: cache_message inserted this fresh ID with dropped=false.
+            // Carry forward a prior refusal before any repair path can serve it.
+            if state.payload_replay_was_refused(&payload) {
+                state.mark_message_dropped(&msg_id);
+            }
             debug!(
                 topic = ?topic,
                 msg_id = ?msg_id,
@@ -10721,6 +10846,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
                 "Topic validator dropped the message — retained in dedupe cache, never served"
             );
             state.mark_message_dropped(&msg_id);
+            state.refuse_payload_replays(&payload);
             self.record_stage(PubSubStage::DedupeCheck, dedupe_started);
             return Ok(());
         }
@@ -13962,6 +14088,147 @@ mod tests {
             "malformed V3 keeps the byte-hash fallback"
         );
         assert_ne!(intent(&reference[..reference.len() - 1]), ref_key);
+    }
+
+    #[test]
+    fn verify_by_kind_attributes_only_the_verified_kind() {
+        let peer_id = test_peer_id(1);
+        let key = test_signing_key();
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(peer_id, transport, key.clone(), false);
+        let topic = TopicId::new([0xa1; 32]);
+
+        let eager = signed_eager_message(&key, topic, [1u8; 32], Bytes::from_static(b"e"));
+        assert!(pubsub.verify_message_signature(&eager));
+        let ihave = signed_control_message(
+            &key,
+            topic,
+            [2u8; 32],
+            MessageKind::IHave,
+            Bytes::from_static(b"h"),
+        );
+        assert!(pubsub.verify_message_signature(&ihave));
+
+        let snap = pubsub.verify_by_kind_stats();
+        let eager_c = snap.for_kind(MessageKind::Eager);
+        let ihave_c = snap.for_kind(MessageKind::IHave);
+        let iwant_c = snap.for_kind(MessageKind::IWant);
+        assert_eq!(eager_c.attempts, 1);
+        assert_eq!(eager_c.failures, 0);
+        assert!(eager_c.total_ns > 0);
+        assert_eq!(ihave_c.attempts, 1);
+        assert_eq!(ihave_c.failures, 0);
+        assert!(ihave_c.total_ns > 0);
+        assert_eq!(iwant_c.attempts, 0);
+        assert_eq!(iwant_c.failures, 0);
+        assert_eq!(iwant_c.total_ns, 0);
+    }
+
+    #[test]
+    fn verify_by_kind_counts_bad_signature_failures() {
+        let peer_id = test_peer_id(2);
+        let key = test_signing_key();
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(peer_id, transport, key.clone(), false);
+        let topic = TopicId::new([0xa2; 32]);
+
+        let mut bad = signed_control_message(
+            &key,
+            topic,
+            [3u8; 32],
+            MessageKind::IWant,
+            Bytes::from_static(b"w"),
+        );
+        bad.signature[0] ^= 0xff;
+        assert!(!pubsub.verify_message_signature(&bad));
+
+        let c = pubsub.verify_by_kind_stats().for_kind(MessageKind::IWant);
+        assert_eq!(c.attempts, 1);
+        assert_eq!(c.failures, 1);
+        assert!(c.total_ns > 0);
+        assert_eq!(
+            pubsub
+                .verify_by_kind_stats()
+                .for_kind(MessageKind::Eager)
+                .attempts,
+            0
+        );
+    }
+
+    #[test]
+    fn verify_by_kind_stats_reads_do_not_reset() {
+        let peer_id = test_peer_id(3);
+        let key = test_signing_key();
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = PlumtreePubSub::new_with_task_control(peer_id, transport, key.clone(), false);
+        let topic = TopicId::new([0xa3; 32]);
+        let msg = signed_eager_message(&key, topic, [4u8; 32], Bytes::from_static(b"n"));
+        assert!(pubsub.verify_message_signature(&msg));
+
+        let first = pubsub.verify_by_kind_stats().for_kind(MessageKind::Eager);
+        let second = pubsub.verify_by_kind_stats().for_kind(MessageKind::Eager);
+        assert_eq!(first, second);
+        assert_eq!(first.attempts, 1);
+
+        assert!(pubsub.verify_message_signature(&msg));
+        let third = pubsub.verify_by_kind_stats().for_kind(MessageKind::Eager);
+        assert_eq!(third.attempts, 2);
+        assert!(third.total_ns >= first.total_ns);
+    }
+
+    #[test]
+    fn verify_by_kind_concurrent_workers_sum_exactly() {
+        let peer_id = test_peer_id(4);
+        let key = test_signing_key();
+        let transport = RecordingTransport::new(peer_id);
+        let pubsub = Arc::new(PlumtreePubSub::new_with_task_control(
+            peer_id,
+            transport,
+            key.clone(),
+            false,
+        ));
+        let topic = TopicId::new([0xa4; 32]);
+        let kinds = [
+            MessageKind::Eager,
+            MessageKind::IHave,
+            MessageKind::IWant,
+            MessageKind::AntiEntropy,
+        ];
+        let per_kind = 8usize;
+        let mut handles = Vec::new();
+        for (worker, kind) in kinds.into_iter().enumerate() {
+            let pubsub = Arc::clone(&pubsub);
+            let key = key.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per_kind {
+                    let mut msg_id = [0u8; 32];
+                    msg_id[0] = worker as u8;
+                    msg_id[1] = i as u8;
+                    let msg =
+                        signed_control_message(&key, topic, msg_id, kind, Bytes::from_static(b"c"));
+                    assert!(pubsub.verify_message_signature(&msg));
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker finished");
+        }
+
+        let snap = pubsub.verify_by_kind_stats();
+        let mut total_attempts = 0u64;
+        let mut total_failures = 0u64;
+        for kind in kinds {
+            let c = snap.for_kind(kind);
+            assert_eq!(c.attempts, per_kind as u64, "{kind:?}");
+            assert_eq!(c.failures, 0, "{kind:?}");
+            assert!(c.total_ns > 0, "{kind:?}");
+            total_attempts += c.attempts;
+            total_failures += c.failures;
+        }
+        assert_eq!(total_attempts, (kinds.len() * per_kind) as u64);
+        assert_eq!(total_failures, 0);
+        // Untouched kinds stay at zero.
+        assert_eq!(snap.for_kind(MessageKind::Ping).attempts, 0);
     }
 
     #[test]
@@ -30252,6 +30519,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_payload_replay_refusal_expires_with_its_entry() {
+        let mut state = TopicState::new();
+        let payload = b"refused payload";
+        assert!(!state.is_payload_replay(payload));
+        state.refuse_payload_replays(payload);
+        assert!(state.is_payload_replay(payload));
+        assert!(state.payload_replay_was_refused(payload));
+        // A policy is checked again when the bounded replay entry expires.
+        state.replay_ttl = Duration::ZERO;
+        assert!(!state.is_payload_replay(payload));
+        assert!(!state.payload_replay_was_refused(payload));
+    }
+
     #[tokio::test]
     async fn test_handle_eager_drops_replayed_payload() {
         let peer_id = test_peer_id(1);
@@ -32130,6 +32411,109 @@ mod tests {
                 snapshot.validator.dropped, 1,
                 "retransmit must hit dedupe, not the validator"
             );
+        }
+
+        /// #116: a new outer ID must not let identical bytes bypass a Drop
+        /// verdict and become serveable by IWANT or anti-entropy. Accepted
+        /// payloads retain the existing cache recovery path for both IDs.
+        #[tokio::test]
+        async fn rewrapped_payload_preserves_validator_refusal_and_recovery() {
+            for refuse in [true, false] {
+                let topic = TopicId::new([0xB6; 32]);
+                let sender = test_peer_id(2);
+                let requester = test_peer_id(3);
+                let transport = RecordingTransport::new(test_peer_id(1));
+                transport.set_connected_peer_ids(vec![requester]);
+                let pubsub = PlumtreePubSub::new_with_task_control(
+                    test_peer_id(1),
+                    Arc::clone(&transport),
+                    test_signing_key(),
+                    false,
+                );
+                pubsub.set_signature_policy(SignaturePolicy::RejectV1);
+                pubsub.set_topic_validator(
+                    topic,
+                    Arc::new(move |_, _| {
+                        if refuse {
+                            ValidationAction::Drop
+                        } else {
+                            ValidationAction::ForwardAndDeliver
+                        }
+                    }),
+                );
+                let key = test_signing_key();
+                let payload = Bytes::from_static(b"same application payload, fresh outer IDs");
+                let ids = [[0x61; 32], [0x62; 32]];
+                for id in ids {
+                    let mut message = signed_eager_message(&key, topic, id, payload.clone());
+                    message.header.seal_payload_hash(Some(&payload));
+                    message.signature = key
+                        .sign(&postcard::to_stdvec(&message.header).unwrap())
+                        .unwrap();
+                    pubsub
+                        .handle_eager(sender, topic, message)
+                        .await
+                        .expect("outer admission");
+                }
+                {
+                    let mut topics = pubsub.topics.write_topic(&topic).await;
+                    let state = topics.get_mut(&topic).expect("topic cached");
+                    for id in ids {
+                        assert_eq!(
+                            state.get_message(&id).expect("dedupe retained").dropped,
+                            refuse,
+                            "each ID must preserve the validator refusal for IWANT/anti-entropy"
+                        );
+                    }
+                }
+                assert_eq!(
+                    pubsub.stage_stats().validator.dropped,
+                    if refuse { 1 } else { 0 }
+                );
+                assert!(
+                    transport.sent_frames().is_empty(),
+                    "no unsolicited send targets"
+                );
+                pubsub
+                    .handle_iwant(requester, topic, ids.to_vec())
+                    .await
+                    .expect("IWANT");
+                let attempts = pubsub
+                    .stage_stats()
+                    .outbound_by_kind
+                    .get("eager")
+                    .map_or(0, |m| m.msgs);
+                assert_eq!(
+                    attempts,
+                    if refuse { 0 } else { 2 },
+                    "refused bytes must never be served"
+                );
+                if !refuse {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            if transport
+                                .sent_messages_of_kind_to(requester, MessageKind::Eager)
+                                .len()
+                                == 2
+                            {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("accepted IDs remain recoverable");
+                    let frames = transport.sent_messages_of_kind_to(requester, MessageKind::Eager);
+                    for id in ids {
+                        assert!(
+                            frames
+                                .iter()
+                                .any(|m| m.header.msg_id == id
+                                    && m.payload.as_ref() == Some(&payload))
+                        );
+                    }
+                }
+            }
         }
 
         /// clear_topic_validator restores default passthrough.

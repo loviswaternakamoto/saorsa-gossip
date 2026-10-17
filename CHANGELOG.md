@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **pubsub: native per-kind outer-signature verify meters (for x0x#1170 /
+  Track E M1).** `PlumtreePubSub::verify_by_kind_stats()` returns a cheap
+  `Copy` snapshot of per-`MessageKind` `{attempts, failures, total_ns}`
+  counters recorded at the ML-DSA verify call site under the frame's wire
+  kind. Counters are cumulative/monotonic (`Relaxed` atomics; never reset by
+  a read), lock-free on the receive hot path, and safe across concurrent
+  receive workers. The API does not go through `stage_stats()` and takes no
+  topic/peer locks. Additive public API only; no wire-format change.
+
+## [0.5.90] - 2026-10-17
+
+### Changed
+
+- **deps: ant-quic pinned to `=0.27.61`** (receive-path fixes; RFC 9221
+  datagram frame-size enforcement).
+
+## [0.5.89] - 2026-10-17
+
+### Security
+
+- **pubsub: a validator refusal now survives payload replays (#116, #117).**
+  A topic validator could drop a payload, yet a sender could rewrap the same
+  bytes under a fresh outer message ID; payload replay suppression returned
+  before validation and left the new message-cache entry serveable, so IWANT
+  would serve the refused bytes. The bounded replay cache now keeps the
+  original refusal beside the payload digest, and each replay of a refused
+  payload has its message-cache entry marked dropped, so refused payloads
+  rewrapped under a new `msg_id` keep the refusal and are not served via
+  IWANT (or anti-entropy, which shares the dropped flag). The validator still
+  runs once per admitted payload; replay TTL, entry limit, accounting and
+  accepted-message recovery are unchanged. No wire format or public API
+  change.
+
+### Changed
+
+- **deps: ant-quic pinned to `=0.27.60` (#114)**, matching x0x main.
+
 ## [0.5.88] - 2026-10-12
 
 ### Added
